@@ -239,44 +239,69 @@ OKX 同样参数、2023-01 起窗口的对照（资金费只覆盖最近约 3 �
 
 ## 前向验证（Demo，2~4 周）
 
-**定位：这是工程验收，不是盈利证明。** BTC 4h 在 3.8 年里 155 笔 ≈ 每月 3.4 笔，4 周只有 3 笔左右，样本量不足以判断策略优劣。它能验证的是真实下单、成交价与手续费、资金费结算、断线重启、SQLite 状态恢复，以及每笔的真实滑点。
+**定位：这是工程验收，不是盈利证明。** BTC 4h 在 3.8 年里 155 笔 ≈ 每月 3.4 笔，单币 4 周只有 3 笔左右，样本量不足以判断策略优劣。它能验证的是真实下单、成交价与手续费、资金费结算、断线重启、SQLite 状态恢复，以及每笔的真实滑点。跑两个品种后笔数翻倍（约 6~7 笔/4 周），仍然只够做工程验收。
 
-配置 `config.forward.yaml`（示例见 `config.forward.example.yaml`）：Binance Demo、永续、BTC/USDT、4h、均线 20/50 + ADX≥20、1x、单笔风险 1%、止损 2ATR、日亏 3% 停开仓、回撤 20% 熔断，账本单独落在 `data/forward.db`。真实资金上限按 500 USDT 设计；Demo 账户余额约 1186，仓位按余额比例缩放，收益率与规模无关。
+### 组合层：为什么是 BTC + SOL
+
+先按同一套参数把 9 个币各跑一遍（2023-01 起、熔断放宽），再把它们做成等权组合（每个币一份本金，曲线相加）：
+
+| 组合 | 总收益 | 夏普 | 最大回撤 | 交易 |
+| --- | --- | --- | --- | --- |
+| BTC | +104.45% | 1.28 | −13.37% | 155 |
+| **BTC + SOL** | **+94.01%** | **1.37** | **−12.90%** | **303** |
+| BTC+SOL+XRP+ADA+AVAX | +70.36% | 1.24 | −15.58% | 773 |
+| 8 个币（再加 BNB/DOGE/LINK） | +45.66% | 1.00 | −12.95% | 1,238 |
+
+**加品种不是越多越好**：只有 BTC+SOL 提升了风险调整收益（夏普 1.28 → 1.37、回撤 −13.4% → −12.9%、笔数翻倍），继续加山寨反而把收益摊薄——它们的夏普只有 0.4~0.8，且和 BTC 高度相关，分散不了风险，只是多付手续费。单币筛选结果：SOL 1.08、XRP 0.83、ADA 0.68、AVAX 0.66、BNB 0.26、DOGE 0.09、LINK 0.08、ETH −0.35（复现脚本 `tools/portfolio_backtest.py`）。
+
+组合层的实现分三块：
+
+1. **每个品种一个进程**，`--symbol` 区分，各自独立持仓、独立账本、独立崩溃恢复。
+2. **权益按份数缩放**：`live.equity_fraction = 0.5` 让每个进程只按「账户权益 × 50%」算仓位，两个加起来敞口不超过 100%，不会互相抢保证金。缩放只影响下单量，交易和统计仍是真实的。
+3. **组合级熔断**：单币的永久熔断关掉（`max_drawdown: 0.99`），改由 `tools/portfolio_guard.py` 盯**账户总权益**：从峰值回撤 20% 就市价清掉所有仓位、写 `halted` 并停机，人工 `--resume` 才能恢复。这样不会因为某个品种回撤 20% 就永久废掉它。
 
 ```powershell
-# 启动看护（已在跑，重复启动会自己退出）
-powershell -NoProfile -ExecutionPolicy Bypass -File tools\forward_bot.ps1
-# 当前状态：持仓、止损、权益、存活、最近成交
+# 组合总览（账户权益、峰值、回撤、持仓）
+.\.venv\Scripts\python.exe tools\portfolio_guard.py --status
+```
+
+配置 `config.portfolio.yaml`（示例 `config.portfolio.example.yaml`）：Binance Demo、永续、4h、均线 20/50 + ADX≥20、1x、单笔风险 1%、止损 2ATR、日亏 3% 停开仓、`equity_fraction: 0.5`，账本 `data/portfolio.db`。真实资金上限按 500 USDT 设计；Demo 余额约 1174，仓位按比例缩放，收益率与规模无关。
+
+```powershell
+# 启动看护（已在跑，重复启动会自己退出）；-Symbols 可换品种
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\forward_bot.ps1 -Symbols "BTC/USDT,SOL/USDT"
+# 每个 run 的概览；加 --run 看单个的持仓、止损、成交
 .\.venv\Scripts\python.exe tools\forward_status.py
 # 阶段报告：指标 + 同期买入持有，可存 CSV
-.\.venv\Scripts\python.exe tools\forward_report.py --out reports\forward
-# 停止：先建 stop 文件，再结束机器人进程
-New-Item logs\forward_bot.stop; Get-Process python | Stop-Process -Force
+.\.venv\Scripts\python.exe tools\forward_report.py --run "testnet:binance:perp:BTC/USDT:USDT:4h:ma_cross" --out reports\forward
+# 停止：建 stop 文件即可，看护进程会在 5 秒内杀掉子进程并退出
+New-Item logs\forward_bot.stop
 ```
 
 看护与自启：
 
-- `tools/forward_bot.ps1` 在机器人退出/崩溃后 60 秒重拉；机器人自己会从 SQLite 恢复持仓、止损和风控状态，重启是安全的。
-- 单实例：`logs/forward_bot.lock` 存看护进程 PID，第二次启动会直接退出，避免两个进程同时下单。
-- 开机自启：`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\tradingbot-forward.cmd`。删掉它就不再自启。
-- 日志：`logs/forward_bot.log`（机器人）、`logs/forward_watchdog.log`（看护事件），均为 UTF-8。
+- `tools/forward_bot.ps1` 每 5 秒检查两个子进程，谁退出就重拉谁；机器人自己会从 SQLite 恢复持仓、止损和风控状态，重启是安全的。同一个循环里每 30 秒跑一次组合闸门。
+- 单实例：`logs/forward_bot.lock` 存看护进程 PID，第二次启动会直接退出，避免重复下单。
+- 开机自启：`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\tradingbot-forward.cmd`（无参数 → 默认 BTC+SOL）。删掉它就不再自启。
+- 日志：`logs/forward_BTC.log`、`logs/forward_SOL.log`（各币）、`logs/forward_guard.log`（组合闸门）、`logs/forward_watchdog.log`（看护事件），均为 UTF-8。
 
 环境坑（都踩过）：
 
 - 这台机器只有 Windows PowerShell 5.1、没有 pwsh 7，脚本要用 `powershell` 跑。
-- 5.1 把**无 BOM 的 .ps1 当 ANSI 读**，脚本里出现中文会直接语法错误，所以 `forward_bot.ps1` 保持纯 ASCII。
+- 5.1 把**无 BOM 的 .ps1 当 ANSI 读**：脚本里出现一个中文字符就可能吞掉换行、把下一行并进注释，而且**不报错**。`forward_bot.ps1` 必须保持纯 ASCII（已加检查：文件里非 ASCII 字节数应为 0）。
+- 从命令行传 `-Symbols BTC/USDT,SOL/USDT` 时逗号会被解析成数组，所以参数类型是 `[string[]]`，脚本再按逗号/空格/分号归一化。
 - 机器人输出用 `cmd /c ... >>` 追加、并设 `PYTHONIOENCODING=utf-8`；PowerShell 的 `*>>` 会写成 UTF-16，和 ASCII 追加混在一个文件里就没法读了。
 
 检查节奏与判据（事先定好，不事后改）：
 
 | 时间点 | 看什么 | 通过标准 |
 | --- | --- | --- |
-| 第 1 天 | 首次开仓、止损价、DB 记录 | 成交价与当时最新价偏差 < 0.2%；手续费率 0.04%；止损 = 入场 ± 2ATR |
-| 第 1 周 | `forward_status` 的存活与权益；手动重启一次 | 重启后持仓、止损、last_signal 不变；失联不超过 1 根 K 线 |
-| 第 2 周 | 资金费结算、日亏与熔断有没有误触发 | 资金费能在权益变化里看到；熔断未触发 |
-| 第 4 周 | `forward_report` 对比同期买入持有 | 工程项全过；收益只作参考（3 笔样本说明不了问题） |
+| 第 1 天 | 两个品种各自首次开仓、止损价、DB 记录 | 成交价与当时最新价偏差 < 0.2%；手续费率 0.04%；止损 = 入场 ± 2ATR |
+| 第 1 周 | `forward_status` 的存活与权益；`portfolio_guard --status` 的回撤 | 重启后持仓、止损、last_signal 不变；失联不超过 1 根 K 线；组合回撤未触发 |
+| 第 2 周 | 资金费结算、日亏与组合闸门有没有误触发 | 资金费能在权益变化里看到；闸门未触发 |
+| 第 4 周 | `forward_report` 对比同期买入持有 | 工程项全过；收益只作参考（约 6 笔样本说明不了问题） |
 
-判定：**工程验收**看 2 周就够（无人工干预、每笔成交有记录、重启不丢状态、无未捕获异常）。**盈利能力**这个窗口给不出结论——要么把窗口拉到 3~6 个月，要么并行跑 3 个币种；但三个进程会各自按同一份余额算仓位，1x 下保证金会互相抢，得先做组合层（按总权益分配风险）才能加币种。现在只跑 BTC 一个币种就是这个原因。
+判定：**工程验收**看 2 周就够（无人工干预、每笔成交有记录、重启不丢状态、无未捕获异常）。**盈利能力**这个窗口给不出结论——要么把窗口拉到 3~6 个月，要么再扩品种，但后者已经证明会摊薄收益，只剩“多攒样本”这一个作用。
 
 ## 代码结构
 

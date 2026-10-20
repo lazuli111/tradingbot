@@ -1,0 +1,39 @@
+# 组合前向验证：BTC + SOL 并行，账户等分成两份（每份 50% 权益）
+# 每个币由独立进程跑，--symbol 覆盖这里的 symbol；组合层风控由 tools/portfolio_guard.py 负责
+# 启动：powershell -NoProfile -ExecutionPolicy Bypass -File tools\forward_bot.ps1
+exchange: binance
+market: perp
+symbol: BTC/USDT
+timeframe: 4h
+initial_equity: 500          # 真实资金上限 500 USDT；Demo 下按账户余额 × equity_fraction 下单
+slippage: 0.0005
+maintenance_margin_rate: 0.004
+
+fees:
+  spot: 0.001
+  perp: 0.0005
+
+strategy:
+  name: ma_cross
+  params:
+    fast: 20
+    slow: 50
+    adx_min: 20              # 前向验证期间不调参
+
+risk:
+  risk_per_trade: 0.01
+  atr_period: 14
+  stop_atr_mult: 2.0
+  take_profit_atr_mult: null
+  leverage: 1
+  max_leverage: 1
+  max_position_pct: 1.0
+  daily_loss_limit: 0.03
+  max_drawdown: 0.99         # 单币永久熔断关掉：它会永久废掉一个品种，
+                             # 组合层用 portfolio_guard 的 20% 回撤（清仓 + 停机）替代
+
+live:
+  poll_seconds: 30
+  warmup_bars: 300
+  db_path: data/portfolio.db
+  equity_fraction: 0.5       # 两个品种各用一半权益；N 个品种就填 1/N

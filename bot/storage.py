@@ -28,6 +28,8 @@ class Storage:
     def __init__(self, path: str | Path, run: str):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(path)
+        # 多品种并行时会有多个进程写同一个账本，WAL 下读写不互相阻塞
+        self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
         self.run = run
 

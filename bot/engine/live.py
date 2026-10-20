@@ -22,6 +22,24 @@ def _fmt_ts(ts: int) -> str:
     return pd.Timestamp(ts, unit="ms", tz="UTC").strftime("%Y-%m-%d %H:%M")
 
 
+class FractionalEquityBroker:
+    """按比例缩放权益再交给风控。
+
+    多品种并行时每个进程只该用自己那一份：比例 = 1/品种数。缩放只影响“拿多少
+    钱去算仓位”，下单、持仓、统计仍然走真实 broker。
+    """
+
+    def __init__(self, inner: Broker, fraction: float):
+        self._inner = inner
+        self.fraction = fraction
+
+    def equity(self, price: float) -> float:
+        return self._inner.equity(price) * self.fraction
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
 class LiveRunner:
     def __init__(self, cfg: Config, mode: str):
         if mode not in ("paper", "testnet"):
@@ -36,6 +54,9 @@ class LiveRunner:
         run = f"{mode}:{cfg.exchange}:{cfg.market}:{self.symbol}:{cfg.timeframe}:{self.strategy.name}"
         self.storage = Storage(cfg.live.db_path, run)
         broker = self._make_broker()
+        if cfg.live.equity_fraction < 1:
+            broker = FractionalEquityBroker(broker, cfg.live.equity_fraction)
+            log.info("按账户权益的 %.0f%% 计算仓位（多品种并行）", cfg.live.equity_fraction * 100)
         risk = RiskManager(cfg.risk, cfg.is_perp, cfg.initial_equity)
         self.trader = Trader(risk, broker, allow_short=cfg.is_perp, on_fill=self._on_fill)
 

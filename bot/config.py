@@ -41,6 +41,9 @@ class LiveConfig:
     poll_seconds: int = 30
     warmup_bars: int = 300
     db_path: str = "data/trades.db"
+    # 多品种并行时，每个进程按“账户权益 × 这个比例”算仓位。1.0 = 独占账户；
+    # 两个币各 0.5，就是把账户等分成两份，合起来敞口不超过 100%。
+    equity_fraction: float = 1.0
 
 
 @dataclass
@@ -89,6 +92,8 @@ class Config:
             raise ValueError("stop_atr_mult 必须大于 0（强制止损）")
         if not 0 < r.max_drawdown < 1 or not 0 < r.daily_loss_limit < 1:
             raise ValueError("max_drawdown / daily_loss_limit 应在 (0, 1) 之间")
+        if not 0 < self.live.equity_fraction <= 1:
+            raise ValueError("live.equity_fraction 应在 (0, 1] 之间")
         if self.is_perp:
             if not 1 <= r.leverage <= r.max_leverage:
                 raise ValueError(f"leverage={r.leverage} 超出允许范围 [1, {r.max_leverage}]")

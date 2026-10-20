@@ -20,7 +20,7 @@ from bot.data import fetch_ohlcv_range, make_exchange, timeframe_ms  # noqa: E40
 from bot.metrics import compute_metrics  # noqa: E402
 from bot.report import format_metrics  # noqa: E402
 
-DEFAULT_DB = "data/forward.db"
+DEFAULT_DB = "data/portfolio.db"
 DEFAULT_RUN = "testnet:binance:perp:BTC/USDT:USDT:4h:ma_cross"
 
 
