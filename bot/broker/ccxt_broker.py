@@ -32,6 +32,7 @@ class CcxtBroker(Broker):
         self.leverage = leverage
         self.position: Position | None = None
         self.stats = BrokerStats()
+        self.hedged = False
         ex.load_markets()
         self.market = ex.market(symbol)
         self.quote = self.market["quote"]
@@ -41,12 +42,22 @@ class CcxtBroker(Broker):
             self.sync_position()
 
     def _setup_perp(self) -> None:
+        # Binance 的 leverage 只收整数，传 1.0 会被判成 malformed（-1102）
+        leverage = int(self.leverage) if float(self.leverage).is_integer() else self.leverage
         for call, args in (("set_margin_mode", ("isolated", self.symbol)),
-                           ("set_leverage", (self.leverage, self.symbol))):
+                           ("set_leverage", (leverage, self.symbol)),
+                           # 单向持仓：双向模式下普通市价单会被拒（-4061），reduceOnly 也不可用
+                           ("set_position_mode", (False, self.symbol))):
             try:
                 getattr(self.ex, call)(*args)
-            except ccxt.BaseError as e:  # already set, or not supported by this exchange
+            except (ccxt.BaseError, AttributeError) as e:  # already set, or not supported here
                 log.warning("%s 失败（可能已设置）: %s", call, e)
+        try:
+            self.hedged = bool(self.ex.fetch_position_mode(self.symbol).get("hedged"))
+        except (ccxt.BaseError, AttributeError) as e:
+            log.warning("读取持仓模式失败，按单向持仓处理: %s", e)
+        if self.hedged:
+            log.warning("账户仍是双向持仓模式，下单将带 positionSide；建议在交易所页面改成单向持仓")
 
     def sync_position(self) -> None:
         positions = [p for p in self.ex.fetch_positions([self.symbol]) if float(p.get("contracts") or 0)]
@@ -87,20 +98,41 @@ class CcxtBroker(Broker):
         log.warning("手续费以 %s 计价，未计入统计", fee.get("currency"))  # e.g. paid in BNB
         return 0.0
 
+    def _fee_from_trades(self, order_id) -> dict:
+        """Binance's futures order payload carries no fee; the trade record does."""
+        if order_id is None:
+            return {}
+        try:
+            trades = self.ex.fetch_my_trades(self.symbol, None, None, {"orderId": order_id})
+        except (ccxt.BaseError, TypeError) as e:
+            log.warning("查成交明细失败，手续费按 0 计: %s", e)
+            return {}
+        fees = [t.get("fee") or {} for t in trades if (t.get("fee") or {}).get("cost")]
+        if not fees:
+            return {}
+        currency = {f.get("currency") for f in fees}
+        return {"currency": currency.pop() if len(currency) == 1 else self.quote,
+                "cost": sum(float(f["cost"]) for f in fees)}
+
     def _send(self, side: str, qty: float, price: float, ts: int, reason: str,
-              reduce_only: bool = False) -> Fill | None:
+              reduce_only: bool = False, position_side: str | None = None) -> Fill | None:
         amount = self._amount(qty)
         min_amount = (self.market.get("limits", {}).get("amount", {}) or {}).get("min") or 0
         if amount <= 0 or amount < min_amount:
             log.warning("下单数量 %s 低于交易所最小值 %s，跳过", amount, min_amount)
             return None
-        params = {"reduceOnly": True} if reduce_only and self.is_perp else {}
+        params = {}
+        if self.is_perp:
+            if self.hedged and position_side:
+                params["positionSide"] = position_side  # 双向模式：靠 positionSide 区分开平仓
+            elif reduce_only:
+                params["reduceOnly"] = True
         order = self.ex.create_order(self.symbol, "market", side, amount, None, params)
         if order.get("status") != "closed" or not order.get("average"):
             order = self.ex.fetch_order(order["id"], self.symbol)
         filled = float(order.get("filled") or amount) * self.contract_size
         avg = float(order.get("average") or price)
-        fee_info = order.get("fee") or {}
+        fee_info = order.get("fee") or self._fee_from_trades(order.get("id"))
         fee = self._fee_in_quote(fee_info, avg)
         if not self.is_perp and side == "buy" and fee_info.get("currency") == self.market["base"]:
             filled -= float(fee_info.get("cost") or 0)  # fee was taken out of the coins we bought
@@ -113,7 +145,8 @@ class CcxtBroker(Broker):
             raise RuntimeError("已有持仓，请先平仓")
         if side == -1 and not self.is_perp:
             raise ValueError("现货不能做空")
-        fill = self._send("buy" if side == 1 else "sell", qty, price, ts, reason)
+        fill = self._send("buy" if side == 1 else "sell", qty, price, ts, reason,
+                          position_side="LONG" if side == 1 else "SHORT")
         if fill is None:
             return None
         self.position = Position(side=side, qty=fill.qty, entry=fill.price, opened_at=ts,
@@ -127,7 +160,7 @@ class CcxtBroker(Broker):
         if pos is None:
             return None
         fill = self._send("sell" if pos.side == 1 else "buy", pos.qty, price, ts, reason,
-                          reduce_only=True)
+                          reduce_only=True, position_side="LONG" if pos.side == 1 else "SHORT")
         if fill is None:
             return None
         net = pos.side * fill.qty * (fill.price - pos.entry) - fill.fee - pos.entry_fee

@@ -23,7 +23,11 @@ def make_exchange(exchange_id: str, market: str, credentials: dict | None = None
         default_type = "spot"
     else:
         default_type = "future" if exchange_id.startswith("binance") else "swap"
-    params = {"enableRateLimit": True, "timeout": 20000, "options": {"defaultType": default_type}}
+    params = {"enableRateLimit": True, "timeout": 20000, "options": {"defaultType": default_type,
+                                                                     # 本机时钟比交易所快 1 秒以上时，
+                                                                     # 签名请求会被拒（Binance -1021）；
+                                                                     # 打开后 load_markets 会先校准时间差
+                                                                     "adjustForTimeDifference": True}}
     params.update(credentials or {})
     ex = getattr(ccxt, exchange_id)(params)
     if testnet:
