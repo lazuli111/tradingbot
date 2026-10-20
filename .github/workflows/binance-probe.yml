@@ -1,0 +1,36 @@
+name: binance-probe
+
+# 一次性探针：确认 GitHub 的 runner 到底能不能访问 Binance。
+# Binance 对部分地区（含美国）返回 HTTP 451，而 GitHub 托管的 runner 默认在美国，
+# 所以"能不能用 Actions 跑这个机器人"完全取决于这一步的结果。
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/binance-probe.yml"
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 这台 runner 在哪
+        run: |
+          curl -s --max-time 15 https://ipinfo.io/json || echo "(ipinfo 不可达)"
+
+      - name: 能连 Binance 吗
+        run: |
+          fail=0
+          for url in \
+            "https://api.binance.com/api/v3/ping" \
+            "https://fapi.binance.com/fapi/v1/ping" \
+            "https://demo-fapi.binance.com/fapi/v1/ping"; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 "$url" || echo "000")
+            echo "$url -> HTTP $code"
+            if [ "$code" != "200" ]; then fail=1; fi
+          done
+          if [ "$fail" = "1" ]; then
+            echo "::error::至少一个端点不通（451 = 地区限制），GitHub Actions 不能用来跑这个机器人"
+            exit 1
+          fi
+          echo "::notice::三个端点都通，Actions 在网络上可行（还有 cron 延迟和状态持久化两个问题要处理）"
