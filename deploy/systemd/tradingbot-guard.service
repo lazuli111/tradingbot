@@ -1,0 +1,19 @@
+[Unit]
+Description=Trading bot portfolio guard (flatten + halt at -20% from peak)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tradingbot
+WorkingDirectory=/opt/tradingbot
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+ExecStart=/opt/tradingbot/.venv/bin/python tools/portfolio_guard.py --loop 60
+Restart=always
+RestartSec=30
+StandardOutput=append:/var/log/tradingbot-guard.log
+StandardError=append:/var/log/tradingbot-guard.log
+
+[Install]
+WantedBy=multi-user.target

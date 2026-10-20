@@ -303,6 +303,15 @@ New-Item logs\forward_bot.stop
 
 判定：**工程验收**看 2 周就够（无人工干预、每笔成交有记录、重启不丢状态、无未捕获异常）。**盈利能力**这个窗口给不出结论——要么把窗口拉到 3~6 个月，要么再扩品种，但后者已经证明会摊薄收益，只剩“多攒样本”这一个作用。
 
+### 部署到常驻主机
+
+本机不能常开，所以要把这套东西挪到一台 24/7 的机器上，完整步骤见 `DEPLOY.md`。三条结论先记在这里：
+
+- **GitHub Actions 不可用**：2026-10-20 用 `.github/workflows/binance-probe.yml` 实测，托管 runner（美国）访问 Binance 返回 **HTTP 451**，连 K 线都拉不到。公开仓库能换到无限分钟，但换不到 IP 地区。
+- **区域必须不是美国**：东京 / 大阪 / 首尔 / 新加坡都可以。GCP 的免费 e2-micro 只在美国三个区，所以免费归免费，不能用。
+- **Oracle Always Free 是当前最划算的**：2 OCPU + 12 GB ARM / 200 GB 盘 / 10 TB 出网（网上的 4/24 是旧数据）。但它的闲置回收规则是「7 天内 CPU、网络、内存 95 分位都低于 20% 就回收」——**交易机器人必然满足**，所以要么升级 Pay As You Go（Always Free 资源仍 $0），要么这台机器同时干点别的活。
+- 部署形态：`docker compose up -d` 起三个容器（BTC、SOL、guard），`restart: unless-stopped` 负责崩溃重启；不想装 Docker 就用 `deploy/systemd/` 下三个 unit。代码零改动。
+
 ## 代码结构
 
 三个引擎共用同一个决策核心：

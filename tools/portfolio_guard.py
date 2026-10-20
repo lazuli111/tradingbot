@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -65,23 +66,8 @@ def flatten(ex) -> int:
     return closed
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="组合层风险闸门")
-    ap.add_argument("--once", action="store_true", help="检查一次，必要时清仓")
-    ap.add_argument("--status", action="store_true", help="只报告")
-    ap.add_argument("--resume", action="store_true", help="解除停机状态")
-    ap.add_argument("--max-dd", type=float, default=0.20, help="组合回撤阈值")
-    ap.add_argument("--exchange", default="binance")
-    args = ap.parse_args()
-
-    load_dotenv()
-    creds = api_credentials(args.exchange)
-    if not {"apiKey", "secret"} <= creds.keys():
-        print("缺少 API Key")
-        return 1
-    ex = make_exchange(args.exchange, "perp", creds, testnet=True)
-    ex.load_markets()
-
+def check(ex, args) -> int:
+    """报告一次；需要时清仓并停机。返回 0 正常、3 触发停机、1 缺配置。"""
     balance = ex.fetch_balance()["USDT"]
     equity = float(balance.get("total") or 0)
     positions = open_positions(ex)
@@ -99,7 +85,7 @@ def main() -> int:
 
     line = (f"{now()}  权益 {equity:.2f}  峰值 {state['peak']:.2f}  回撤 {dd:+.2%}  "
             f"持仓 {len(positions)}  免费 {float(balance.get('free') or 0):.2f}")
-    print(line + ("  [已停机]" if state["halted"] else ""))
+    print(line + ("  [已停机]" if state["halted"] else ""), flush=True)
 
     if args.status:
         for p in positions:
@@ -120,6 +106,37 @@ def main() -> int:
 
     save_state(state)
     return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="组合层风险闸门")
+    ap.add_argument("--once", action="store_true", help="检查一次，必要时清仓")
+    ap.add_argument("--loop", type=int, metavar="SECONDS", help="常驻：每 N 秒检查一次")
+    ap.add_argument("--status", action="store_true", help="只报告")
+    ap.add_argument("--resume", action="store_true", help="解除停机状态")
+    ap.add_argument("--max-dd", type=float, default=0.20, help="组合回撤阈值")
+    ap.add_argument("--exchange", default="binance")
+    args = ap.parse_args()
+
+    load_dotenv()
+    creds = api_credentials(args.exchange)
+    if not {"apiKey", "secret"} <= creds.keys():
+        print("缺少 API Key")
+        return 1
+    ex = make_exchange(args.exchange, "perp", creds, testnet=True)
+    ex.load_markets()
+
+    if not args.loop:
+        return check(ex, args)
+
+    while True:  # 常驻模式：单次失败不应该让闸门退出
+        try:
+            code = check(ex, args)
+            if code == 3:
+                print(f"{now()}  已清仓并停机；继续值守，人工 --resume 后恢复", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"{now()}  本轮检查失败: {e}", flush=True)
+        time.sleep(args.loop)
 
 
 if __name__ == "__main__":

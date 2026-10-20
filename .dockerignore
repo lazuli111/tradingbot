@@ -1,0 +1,13 @@
+.git
+.github
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.env
+data
+reports
+logs
+config.yaml
+config.*.yaml
+!config.portfolio.example.yaml

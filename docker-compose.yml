@@ -1,0 +1,45 @@
+# 常驻部署：两个品种各一个容器 + 一个组合闸门容器，全部 restart: unless-stopped
+#
+#   cp config.portfolio.example.yaml config.portfolio.yaml   # 按需改 equity_fraction
+#   cp .env.example .env && vi .env                          # 填 Demo Key
+#   docker compose up -d --build
+#
+# 查看：docker compose ps ; docker compose logs -f btc
+# 停止：docker compose down
+services:
+  btc:
+    build: .
+    image: tradingbot:latest
+    command: ["python", "main.py", "testnet", "--config", "config.portfolio.yaml", "--symbol", "BTC/USDT"]
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./config.portfolio.yaml:/app/config.portfolio.yaml:ro
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+  sol:
+    image: tradingbot:latest
+    command: ["python", "main.py", "testnet", "--config", "config.portfolio.yaml", "--symbol", "SOL/USDT"]
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./config.portfolio.yaml:/app/config.portfolio.yaml:ro
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+  # 组合层闸门：账户总权益从峰值回撤 20% 就清仓并停机（人工 --resume 才恢复）
+  guard:
+    image: tradingbot:latest
+    command: ["python", "tools/portfolio_guard.py", "--loop", "60"]
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }

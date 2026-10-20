@@ -1,0 +1,19 @@
+[Unit]
+Description=Trading bot forward test - SOL/USDT (Binance demo)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tradingbot
+WorkingDirectory=/opt/tradingbot
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+ExecStart=/opt/tradingbot/.venv/bin/python main.py testnet --config config.portfolio.yaml --symbol SOL/USDT
+Restart=always
+RestartSec=30
+StandardOutput=append:/var/log/tradingbot-sol.log
+StandardError=append:/var/log/tradingbot-sol.log
+
+[Install]
+WantedBy=multi-user.target
