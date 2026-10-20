@@ -27,6 +27,7 @@
 | 模拟盘（paper） | 已验证 | OKX 永续 1m；**Binance 永续 1m 3 根 K 线 + 重启恢复** |
 | Binance 行情（K 线、资金费率历史） | **已验证** | 无 451；资金费历史从 2023-01 起完整，回测无“只提供…之后”警告 |
 | Binance Demo Trading 下单 | **已验证** | 现货买卖、永续开平（逐仓 + `reduceOnly`）、软止损、重启恢复全部在 Demo 账户上跑通 |
+| 前向验证（Demo 4h 永续） | **进行中** | 2026-10-20 起连续跑 2~4 周，BTC/USDT 4h，见[前向验证](#前向验证demo2-4-周) |
 | 实盘交易 | 不支持 | 刻意不做：非测试网直接抛出 NotImplementedError |
 
 代码在 GitHub 私有仓库里，本文件随代码一起提交。
@@ -214,6 +215,47 @@ OKX 同样参数、2023-01 起窗口的对照（资金费只覆盖最近约 3 �
 - **手续费币种**：如果手续费用 BNB 支付，代码只会打印警告，不计入统计。建议在模拟账户里关闭“用 BNB 抵扣手续费”。实测用 USDT 结算时已能正确读到（见上面第 4 条修复）。
 - **最小下单量**：只检查了交易所的最小数量（`limits.amount.min`），没检查最小名义价值。实测的合约门槛是 50 USDT、现货 5 USDT，Demo 账户余额足够；小资金实盘前要补这个检查。
 - **成交回报**：市价单返回的状态不是 closed 时，代码会再查一次订单，但只查一次。实测 Demo 环境市价单都是立即 `closed`，没有遇到慢成交。
+
+## 前向验证（Demo，2~4 周）
+
+**定位：这是工程验收，不是盈利证明。** BTC 4h 在 3.8 年里 155 笔 ≈ 每月 3.4 笔，4 周只有 3 笔左右，样本量不足以判断策略优劣。它能验证的是真实下单、成交价与手续费、资金费结算、断线重启、SQLite 状态恢复，以及每笔的真实滑点。
+
+配置 `config.forward.yaml`（示例见 `config.forward.example.yaml`）：Binance Demo、永续、BTC/USDT、4h、均线 20/50 + ADX≥20、1x、单笔风险 1%、止损 2ATR、日亏 3% 停开仓、回撤 20% 熔断，账本单独落在 `data/forward.db`。真实资金上限按 500 USDT 设计；Demo 账户余额约 1186，仓位按余额比例缩放，收益率与规模无关。
+
+```powershell
+# 启动看护（已在跑，重复启动会自己退出）
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\forward_bot.ps1
+# 当前状态：持仓、止损、权益、存活、最近成交
+.\.venv\Scripts\python.exe tools\forward_status.py
+# 阶段报告：指标 + 同期买入持有，可存 CSV
+.\.venv\Scripts\python.exe tools\forward_report.py --out reports\forward
+# 停止：先建 stop 文件，再结束机器人进程
+New-Item logs\forward_bot.stop; Get-Process python | Stop-Process -Force
+```
+
+看护与自启：
+
+- `tools/forward_bot.ps1` 在机器人退出/崩溃后 60 秒重拉；机器人自己会从 SQLite 恢复持仓、止损和风控状态，重启是安全的。
+- 单实例：`logs/forward_bot.lock` 存看护进程 PID，第二次启动会直接退出，避免两个进程同时下单。
+- 开机自启：`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\tradingbot-forward.cmd`。删掉它就不再自启。
+- 日志：`logs/forward_bot.log`（机器人）、`logs/forward_watchdog.log`（看护事件），均为 UTF-8。
+
+环境坑（都踩过）：
+
+- 这台机器只有 Windows PowerShell 5.1、没有 pwsh 7，脚本要用 `powershell` 跑。
+- 5.1 把**无 BOM 的 .ps1 当 ANSI 读**，脚本里出现中文会直接语法错误，所以 `forward_bot.ps1` 保持纯 ASCII。
+- 机器人输出用 `cmd /c ... >>` 追加、并设 `PYTHONIOENCODING=utf-8`；PowerShell 的 `*>>` 会写成 UTF-16，和 ASCII 追加混在一个文件里就没法读了。
+
+检查节奏与判据（事先定好，不事后改）：
+
+| 时间点 | 看什么 | 通过标准 |
+| --- | --- | --- |
+| 第 1 天 | 首次开仓、止损价、DB 记录 | 成交价与当时最新价偏差 < 0.2%；手续费率 0.04%；止损 = 入场 ± 2ATR |
+| 第 1 周 | `forward_status` 的存活与权益；手动重启一次 | 重启后持仓、止损、last_signal 不变；失联不超过 1 根 K 线 |
+| 第 2 周 | 资金费结算、日亏与熔断有没有误触发 | 资金费能在权益变化里看到；熔断未触发 |
+| 第 4 周 | `forward_report` 对比同期买入持有 | 工程项全过；收益只作参考（3 笔样本说明不了问题） |
+
+判定：**工程验收**看 2 周就够（无人工干预、每笔成交有记录、重启不丢状态、无未捕获异常）。**盈利能力**这个窗口给不出结论——要么把窗口拉到 3~6 个月，要么并行跑 3 个币种；但三个进程会各自按同一份余额算仓位，1x 下保证金会互相抢，得先做组合层（按总权益分配风险）才能加币种。现在只跑 BTC 一个币种就是这个原因。
 
 ## 代码结构
 

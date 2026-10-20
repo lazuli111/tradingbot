@@ -1,0 +1,37 @@
+# 前向验证配置：Binance Demo Trading，永续 4h，参数与回测里验证过的那组完全一致
+# 用途：连续跑 2~4 周，检验真实下单 / 资金费 / 滑点 / 断线重启，而不是用来证明收益
+# 启动：tools\forward_bot.ps1（watchdog，进程挂了会自动重启）
+exchange: binance
+market: perp
+symbol: BTC/USDT
+timeframe: 4h
+initial_equity: 500          # 真实资金上限 500 USDT；Demo 里按账户实际余额下单，收益率与规模无关
+slippage: 0.0005
+maintenance_margin_rate: 0.004
+
+fees:
+  spot: 0.001
+  perp: 0.0005
+
+strategy:
+  name: ma_cross
+  params:
+    fast: 20
+    slow: 50
+    adx_min: 20              # 默认配置，不要在前向验证期间调参
+
+risk:
+  risk_per_trade: 0.01
+  atr_period: 14
+  stop_atr_mult: 2.0
+  take_profit_atr_mult: null
+  leverage: 1
+  max_leverage: 1            # 锁死 1x：1x 逐仓下强平要 -99% 才触发
+  max_position_pct: 1.0
+  daily_loss_limit: 0.03     # 日内 -3% 停止开新仓
+  max_drawdown: 0.20         # 回撤 20% 熔断（永久停机，需要人工恢复）
+
+live:
+  poll_seconds: 30
+  warmup_bars: 300
+  db_path: data/forward.db   # 独立账本，不和测试期的 trades.db 混
