@@ -68,10 +68,16 @@ class CcxtBroker(Broker):
         side = 1 if p["side"] == "long" else -1
         qty = float(p["contracts"]) * self.contract_size
         stop = tp = None
-        if self.position and self.position.side == side:  # keep locally tracked soft stops
+        entry_fee = funding = 0.0
+        if self.position and self.position.side == side:
+            # keep locally tracked soft stops, and the entry fee / funding we already booked:
+            # the exchange's position payload carries neither, and dropping entry_fee would
+            # overstate the round-trip PnL by one side's commission.
             stop, tp = self.position.stop, self.position.take_profit
+            entry_fee, funding = self.position.entry_fee, self.position.funding
         self.position = Position(side=side, qty=qty, entry=float(p["entryPrice"]),
                                  opened_at=int(p.get("timestamp") or 0),
+                                 entry_fee=entry_fee, funding=funding,
                                  margin=float(p.get("initialMargin") or 0),
                                  liq_price=float(p["liquidationPrice"]) if p.get("liquidationPrice") else None,
                                  stop=stop, take_profit=tp)

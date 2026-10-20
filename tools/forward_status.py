@@ -63,12 +63,14 @@ def main() -> int:
     peak = max(e for _, e in equity)
     mdd = min(e / max(x for t, x in equity if t <= ts) - 1 for ts, e in equity)
     days = (last_ts - first_ts) / 86_400_000
-    stale_h = (datetime.now(timezone.utc).timestamp() * 1000 - last_ts) / 3_600_000
+    bar_ms = args.bar_hours * 3_600_000
+    # 记录的是 K 线开盘时间，等它收盘还要一个周期，所以从“收盘时刻”开始算失联
+    stale_h = max(0.0, (datetime.now(timezone.utc).timestamp() * 1000 - (last_ts + bar_ms)) / 3_600_000)
 
     print(f"权益     {last_eq:.2f}（起始 {first_eq:.2f}，{last_eq / first_eq - 1:+.2%}，峰值 {peak:.2f}，回撤 {mdd:.2%}）")
     print(f"运行     {days:.1f} 天，{len(equity)} 根 K 线，{len(fills)} 笔成交")
-    print(f"存活     最后一根 K 线 {utc(last_ts)} UTC（K 线开盘时间），距今 {stale_h:.1f} 小时"
-          f" / 警戒线 {STALE_BARS * args.bar_hours:.0f} 小时"
+    print(f"存活     最后一根 K 线 {utc(last_ts)} UTC 开盘、{utc(last_ts + bar_ms)} UTC 收盘；"
+          f"距收盘 {stale_h:.1f} 小时 / 警戒线 {STALE_BARS * args.bar_hours:.0f} 小时"
           f"{'  ⚠ 超过警戒线，进程可能已停止' if stale_h > STALE_BARS * args.bar_hours else ''}")
     for f in fills[-5:]:
         ts, side, qty, price, fee, pnl, reason = f
