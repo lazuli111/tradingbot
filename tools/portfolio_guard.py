@@ -92,6 +92,11 @@ def check(ex, args) -> int:
             print(f"    {p['symbol']} {p['side']} {p['contracts']} 入场 {p['entryPrice']}")
         return 0
 
+    if args.flatten:
+        print(f"{now()}  手动清仓，共 {len(positions)} 个仓位")
+        flatten(ex)
+        return 0
+
     if state["halted"]:
         save_state(state)
         return 0
@@ -114,6 +119,7 @@ def main() -> int:
     ap.add_argument("--loop", type=int, metavar="SECONDS", help="常驻：每 N 秒检查一次")
     ap.add_argument("--status", action="store_true", help="只报告")
     ap.add_argument("--resume", action="store_true", help="解除停机状态")
+    ap.add_argument("--flatten", action="store_true", help="立即市价平掉所有仓位（不改停机状态）")
     ap.add_argument("--max-dd", type=float, default=0.20, help="组合回撤阈值")
     ap.add_argument("--exchange", default="binance")
     args = ap.parse_args()

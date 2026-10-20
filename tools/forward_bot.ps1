@@ -97,7 +97,11 @@ try {
 finally {
     foreach ($symbol in $symbols) {
         $child = $children[$symbol]
-        if ($child -and -not $child.HasExited) { Stop-Process -Id $child.Id -Force -ErrorAction SilentlyContinue }
+        if ($child -and -not $child.HasExited) {
+            # The child is cmd.exe wrapping python; killing only cmd leaves the bot
+            # running unsupervised, so take down the whole tree.
+            cmd /c "taskkill /PID $($child.Id) /T /F" | Out-Null
+        }
     }
     Remove-Item $lockFile -Force -ErrorAction SilentlyContinue
     Write-Log "watchdog stopped"
