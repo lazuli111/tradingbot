@@ -1,0 +1,43 @@
+# 复制为 config.yaml 后修改；命令行参数可覆盖其中部分字段
+
+exchange: binance        # ccxt 交易所 ID，如 binance / okx
+market: spot             # spot = 现货（只做多）；perp = USDT 永续合约（可做空、可加杠杆）
+symbol: BTC/USDT         # 永续合约会自动转换为 BTC/USDT:USDT
+timeframe: 1h
+initial_equity: 10000    # 回测 / 模拟盘初始资金（USDT）
+slippage: 0.0005         # 每次成交的滑点比例
+maintenance_margin_rate: 0.004   # 合约维持保证金率，用于估算强平价
+
+fees:
+  spot: 0.001            # 现货 taker 手续费
+  perp: 0.0005           # 合约 taker 手续费
+
+strategy:
+  name: ma_cross         # ma_cross | donchian
+  params:
+    fast: 20
+    slow: 50
+    # —— 入场过滤（任何策略都可用；只拦截新开仓，不会强制平掉已有持仓）——
+    adx_min: 20            # 趋势强度：ADX 低于该值时不开新仓（0 = 关闭）。见 README「过滤器实验」
+    # adx_period: 14
+    # vol_max_pct: 0.8     # 波动率过滤：ATR/价格 在最近 vol_lookback 根 K 线里的百分位
+    # vol_min_pct: 0.0     #   不在 [vol_min_pct, vol_max_pct] 区间内时不开新仓（0 / 1 = 关闭）
+    # vol_lookback: 180
+
+risk:
+  risk_per_trade: 0.01         # 每笔交易最多亏损权益的 1%（触发止损时）
+  atr_period: 14
+  stop_atr_mult: 2.0           # 止损距离 = ATR × 倍数
+  take_profit_atr_mult: null   # 止盈距离 = ATR × 倍数；null 表示不设止盈，靠信号离场
+  leverage: 1                  # 合约杠杆；现货必须为 1
+  max_leverage: 3              # 杠杆上限（安全阀）
+  max_position_pct: 1.0        # 现货最大仓位占权益比例
+  daily_loss_limit: 0.03       # 当日亏损达到 3% 后当天停止开新仓
+  max_drawdown: 0.20           # 从权益高点回撤 20% 后平仓并永久停止
+
+live:
+  poll_seconds: 30             # 模拟盘 / 测试网轮询间隔
+  warmup_bars: 300             # 启动时加载的历史 K 线数量
+  db_path: data/trades.db
+
+data_dir: data
