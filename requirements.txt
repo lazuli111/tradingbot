@@ -1,4 +1,4 @@
-ccxt>=4.5
+ccxt==4.5.88  # pinned: Binance demo-trading endpoints verified on this version
 pandas>=2.2
 numpy>=1.26
 pyyaml>=6.0

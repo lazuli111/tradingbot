@@ -31,12 +31,12 @@
 拿到代码后大约 5 分钟能跑通测试；测试完全离线，不需要联网。
 
 1. 克隆仓库。`.venv/`、`data/`、`reports/`、`config.yaml`、`.env` 都在 `.gitignore` 里，不会被提交；数据缓存和报告接手后会重新生成。
-2. 开发时用的版本是 Python 3.13.5、ccxt 4.5.88。`requirements.txt` 里只写了 `ccxt>=4.5`，建议先固定到 4.5.88 做验证：Binance 模拟交易的接入方式在 ccxt 各版本间变过。
+2. 开发时用的版本是 Python 3.13.5、ccxt 4.5.88。`requirements.txt` 已把 ccxt 固定为 `==4.5.88`：Binance 模拟交易的接入方式在 ccxt 各版本间变过，升级 ccxt 前要先重新确认测试网地址（见测试网接入第 3 步）。
 3. 安装依赖：
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt "ccxt==4.5.88"
+.venv/bin/pip install -r requirements.txt
 ```
 
 4. 复制配置：`cp config.example.yaml config.yaml`，`cp .env.example .env`。
