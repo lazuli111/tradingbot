@@ -10,12 +10,16 @@
 输出目录结构（时间都是毫秒 UTC，小时按本地接收时间切）：
 
     <out>/bookTicker/<SYMBOL>/<YYYYMMDD-HH>.csv.gz   E,T,recv,bid,bid_qty,ask,ask_qty
-    <out>/aggTrade/<SYMBOL>/<YYYYMMDD-HH>.csv.gz     E,T,recv,agg_id,price,qty,buyer_maker,n_fills
-    <out>/sessions.csv                              event,recv,detail（connect/alive/disconnect…）
+    <out>/aggTrade/<SYMBOL>/<YYYYMMDD-HH>.csv.gz     E,T,recv,agg_id,price,qty,nq,buyer_maker,n_fills
+    <out>/sessions.csv                              event,recv,conn,detail（connect/alive/disconnect…）
     <out>/meta.json                                 启动时的 tickSize / stepSize
+    <out>/recorder.pid                              运行中的进程号，退出时删除
 
 每次刷盘向 .csv.gz 追加一个新的 gzip member，进程被强杀最多丢最后一个刷盘周期，
 已写入的部分仍可读。断线空档由 sessions.csv 推出来（见 read_coverage），分析时剔除。
+
+Binance 合约行情现在分两类地址（2026-10 实测）：bookTicker 走 /public/stream，aggTrade 只在
+/market/stream 上推（旧的 /stream 已收不到 aggTrade）。所以开两条连接，有效时间取两者的交集。
 """
 from __future__ import annotations
 
@@ -37,7 +41,8 @@ from aiohttp import WSMsgType
 
 log = logging.getLogger("mm.recorder")
 
-WS_BASE = "wss://fstream.binance.com/stream?streams="
+WS_ROOT = "wss://fstream.binance.com"
+CONNECTIONS = {"public": "bookTicker", "market": "aggTrade"}  # 连接名 -> 这条连接上订阅的流
 REST_BASE = "https://fapi.binance.com"
 HOUR_MS = 3_600_000
 
@@ -46,17 +51,17 @@ DEFAULT_SYMBOLS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT",
     "DOGEUSDT", "NEARUSDT", "WLDUSDT", "UNIUSDT", "AVAXUSDT", "LTCUSDT",
     "ADAUSDT", "COMPUSDT", "CRVUSDT", "FETUSDT", "TRUMPUSDT",
+    "ICNTUSDT", "RENDERUSDT", "BMTUSDT",  # tick ≈ 4.4~5.4bp，做市最有可能为正的一类
 ]
 
 HEADERS = {
     "bookTicker": "E,T,recv,bid,bid_qty,ask,ask_qty",
-    "aggTrade": "E,T,recv,agg_id,price,qty,buyer_maker,n_fills",
+    "aggTrade": "E,T,recv,agg_id,price,qty,nq,buyer_maker,n_fills",
 }
 
 
-def stream_url(symbols: list[str], base: str = WS_BASE) -> str:
-    streams = [f"{s.lower()}@{kind}" for s in symbols for kind in ("bookTicker", "aggTrade")]
-    return base + "/".join(streams)
+def stream_url(symbols: list[str], conn: str, root: str = WS_ROOT) -> str:
+    return f"{root}/{conn}/stream?streams=" + "/".join(f"{s.lower()}@{CONNECTIONS[conn]}" for s in symbols)
 
 
 def hour_key(ms: int) -> str:
@@ -67,7 +72,8 @@ def parse_message(msg: dict, recv_ms: int) -> tuple[str, str, str, tuple[str, st
     """组合流消息 -> (类型, 品种, CSV 行, 买一卖一价)。不认识的消息返回 None。
 
     价格和数量原样保留交易所给的字符串，避免浮点格式化的误差和开销。
-    aggTrade 的 m=true 表示买方是挂单方，也就是主动卖出（打买一）。
+    aggTrade 的 m=true 表示买方是挂单方，也就是主动卖出（打买一）。nq 是交易所另给的数量字段
+    （疑似不含 RPI 订单的部分），原样保留，没有就留空。
     """
     d = msg.get("data", msg)
     kind = d.get("e")
@@ -76,7 +82,8 @@ def parse_message(msg: dict, recv_ms: int) -> tuple[str, str, str, tuple[str, st
         return kind, d["s"], row, (d["b"], d["a"])
     if kind == "aggTrade":
         n_fills = int(d["l"]) - int(d["f"]) + 1
-        row = f"{d['E']},{d['T']},{recv_ms},{d['a']},{d['p']},{d['q']},{int(bool(d['m']))},{n_fills}"
+        row = (f"{d['E']},{d['T']},{recv_ms},{d['a']},{d['p']},{d['q']},{d.get('nq', '')},"
+               f"{int(bool(d['m']))},{n_fills}")
         return kind, d["s"], row, ("", "")
     return None
 
@@ -132,49 +139,73 @@ class HourlyGzipWriter:
 
 
 class SessionLog:
-    """sessions.csv：connect / alive / disconnect / start / stop，每行立刻落盘。"""
+    """sessions.csv：start / stop（整个进程）和每条连接的 connect / alive / disconnect，每行立刻落盘。"""
 
     def __init__(self, path: Path):
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.exists():
-            path.write_text("event,recv,detail\n")
+            path.write_text("event,recv,conn,detail\n")
 
-    def write(self, event: str, ts_ms: int, detail: str = "") -> None:
+    def write(self, event: str, ts_ms: int, conn: str = "", detail: str = "") -> None:
         detail = detail.replace(",", ";").replace("\n", " ")[:200]
         with open(self.path, "a") as f:
-            f.write(f"{event},{ts_ms},{detail}\n")
+            f.write(f"{event},{ts_ms},{conn},{detail}\n")
+
+
+def _intersect(a: list[tuple[int, int]], b: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    out, i, j = [], 0, 0
+    while i < len(a) and j < len(b):
+        lo, hi = max(a[i][0], b[j][0]), min(a[i][1], b[j][1])
+        if hi > lo:
+            out.append((lo, hi))
+        if a[i][1] < b[j][1]:
+            i += 1
+        else:
+            j += 1
+    return out
 
 
 def read_coverage(lines: list[str]) -> list[tuple[int, int]]:
     """由 sessions.csv 的行推出“确实在收数据”的时间段 [(start, end)]（毫秒，本地接收时间）。
 
-    connect 开一段；alive 把段尾推到最后收到消息的时间；disconnect / stop 结束这一段。
-    进程被强杀时没有 disconnect，下一次 start / connect 时把上一段截在最后一次 alive。
-    空档就是这些时间段之间的部分。
+    每条连接分别算：connect 开一段；alive 把段尾推到最后收到消息的时间；disconnect 结束这一段。
+    进程被强杀时没有 disconnect，下一次 start 时把所有连接截在各自最后一次 alive。
+    最后取所有连接的交集（分析要同时有报价和成交）。空档就是这些时间段之间的部分。
     """
-    out: list[tuple[int, int]] = []
-    start = end = None
+    spans: dict[str, list[tuple[int, int]]] = {}
+    open_: dict[str, list[int]] = {}
+
+    def close(conn: str) -> None:
+        start, end = open_.pop(conn)
+        if end > start:
+            spans.setdefault(conn, []).append((start, end))
+
     for line in lines:
-        parts = line.strip().split(",", 2)
-        if len(parts) < 2 or parts[0] == "event" or not parts[1].isdigit():
+        parts = line.strip().split(",", 3)
+        if len(parts) < 3 or parts[0] == "event" or not parts[1].isdigit():
             continue
-        event, ts = parts[0], int(parts[1])
-        if event == "connect":
-            if start is not None and end is not None and end > start:
-                out.append((start, end))
-            start, end = ts, ts
-        elif start is None:
-            continue
-        elif event == "alive":
-            end = max(end, ts)
-        elif event in ("disconnect", "stop", "start"):
-            end = max(end, ts) if event == "disconnect" else end
-            if end > start:
-                out.append((start, end))
-            start = end = None
-    if start is not None and end is not None and end > start:
-        out.append((start, end))
+        event, ts, conn = parts[0], int(parts[1]), parts[2]
+        if event in ("start", "stop"):
+            for c in list(open_):
+                close(c)
+        elif event == "connect":
+            if conn in open_:
+                close(conn)
+            open_[conn] = [ts, ts]
+            spans.setdefault(conn, [])
+        elif conn in open_ and event in ("alive", "disconnect"):
+            open_[conn][1] = max(open_[conn][1], ts)
+            if event == "disconnect":
+                close(conn)
+    for c in list(open_):
+        close(c)
+    conns = list(spans.values())
+    if not conns:
+        return []
+    out = conns[0]
+    for other in conns[1:]:
+        out = _intersect(out, other)
     return out
 
 
@@ -198,7 +229,7 @@ class RecorderConfig:
     min_free_gb: float = 5.0
     duration_hours: float | None = None
     stats_minutes: float = 10.0
-    ws_base: str = WS_BASE  # 测试时指向本地假服务器
+    ws_root: str = WS_ROOT  # 测试时指向本地假服务器
     fetch_meta: bool = True
 
 
@@ -209,14 +240,14 @@ class Recorder:
         self.sessions = SessionLog(cfg.out / "sessions.csv")
         self.throttle = BookThrottle(cfg.qty_interval_ms)
         self.stop = asyncio.Event()
-        self.last_msg_ms = 0
-        self.connected = False
+        self.last_msg_ms = {c: 0 for c in CONNECTIONS}
+        self.connected = {c: False for c in CONNECTIONS}
         self.counts = {"bookTicker": 0, "aggTrade": 0, "kept_book": 0}
         self.max_latency_ms = 0
         self.reconnects = 0
         self.bad_messages = 0
 
-    def handle(self, raw: str, recv_ms: int) -> None:
+    def handle(self, raw: str, recv_ms: int, conn: str = "public") -> None:
         try:
             parsed = parse_message(json.loads(raw), recv_ms)
         except (ValueError, KeyError, TypeError) as e:
@@ -228,7 +259,7 @@ class Recorder:
             return
         kind, symbol, row, (bid, ask) = parsed
         self.counts[kind] += 1
-        self.last_msg_ms = recv_ms
+        self.last_msg_ms[conn] = recv_ms
         if kind == "bookTicker":
             if not self.throttle.keep(symbol, bid, ask, recv_ms):
                 return
@@ -238,8 +269,9 @@ class Recorder:
 
     def flush(self) -> None:
         self.writer.flush()
-        if self.connected and self.last_msg_ms:
-            self.sessions.write("alive", self.last_msg_ms)
+        for conn, up in self.connected.items():
+            if up and self.last_msg_ms[conn]:
+                self.sessions.write("alive", self.last_msg_ms[conn], conn)
 
     def check_limits(self) -> str | None:
         rss = rss_mb()
@@ -262,7 +294,7 @@ class Recorder:
             reason = self.check_limits()
             if reason:
                 log.error("超出资源上限，停止录制：%s", reason)
-                self.sessions.write("limit", now_ms(), reason)
+                self.sessions.write("limit", now_ms(), detail=reason)
                 self.stop.set()
             if self.cfg.duration_hours and time.monotonic() - started > self.cfg.duration_hours * 3600:
                 log.info("达到 --duration-hours，停止")
@@ -288,21 +320,29 @@ class Recorder:
         except Exception as e:  # meta 只是辅助信息，拿不到时分析会从数据里推 tick
             log.warning("exchangeInfo 获取失败：%s", e)
 
+    async def _stop_on_error(self, coro) -> None:
+        """一条连接意外崩了就整体停下（只剩一条连接录下来的数据没法用）。"""
+        try:
+            await coro
+        except BaseException:
+            self.stop.set()
+            raise
+
     async def _close_on_stop(self, ws) -> None:
         await self.stop.wait()
         await ws.close()
 
-    async def stream(self, http) -> None:
+    async def stream(self, http, conn: str) -> None:
         backoff = 1.0
-        url = stream_url(self.cfg.symbols, self.cfg.ws_base)
+        url = stream_url(self.cfg.symbols, conn, self.cfg.ws_root)
         while not self.stop.is_set():
             detail = ""
             try:
                 async with http.ws_connect(url, autoping=True, heartbeat=None, max_msg_size=2**22,
                                            timeout=aiohttp.ClientWSTimeout(ws_close=5.0)) as ws:
-                    self.connected = True
-                    self.sessions.write("connect", now_ms())
-                    log.info("已连接，%d 个品种", len(self.cfg.symbols))
+                    self.connected[conn] = True
+                    self.sessions.write("connect", now_ms(), conn)
+                    log.info("%s 已连接，%d 个品种", conn, len(self.cfg.symbols))
                     closer = asyncio.create_task(self._close_on_stop(ws))
                     got_first = False
                     try:
@@ -313,7 +353,7 @@ class Recorder:
                                 detail = f"idle>{self.cfg.idle_timeout:.0f}s"
                                 break
                             if msg.type == WSMsgType.TEXT:
-                                self.handle(msg.data, now_ms())
+                                self.handle(msg.data, now_ms(), conn)
                                 if not got_first:
                                     got_first, backoff = True, 1.0
                             elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED,
@@ -324,15 +364,15 @@ class Recorder:
                         closer.cancel()
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError) as e:
                 detail = f"{type(e).__name__}: {e}"
-            if self.connected:
-                # 段尾记最后收到消息的时间（没收到过就记连上的时间，read_coverage 会丢掉空段）
+            if self.connected[conn]:
+                # 段尾记最后收到消息的时间（这一段没收到过消息时它早于 connect，read_coverage 会丢掉空段）
                 self.writer.flush()
-                self.sessions.write("disconnect", self.last_msg_ms or now_ms(), detail or "stop")
-                self.connected = False
+                self.sessions.write("disconnect", self.last_msg_ms[conn], conn, detail or "stop")
+                self.connected[conn] = False
             if self.stop.is_set():
                 break
             self.reconnects += 1
-            log.warning("断线（%s），%.0f 秒后重连", detail, backoff)
+            log.warning("%s 断线（%s），%.0f 秒后重连", conn, detail, backoff)
             try:
                 await asyncio.wait_for(self.stop.wait(), backoff)
             except asyncio.TimeoutError:
@@ -344,19 +384,26 @@ class Recorder:
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, self.stop.set)
-        self.sessions.write("start", now_ms(), " ".join(self.cfg.symbols))
+        pid_file = self.cfg.out / "recorder.pid"  # 停止：kill -TERM $(cat <out>/recorder.pid)
+        pid_file.write_text(f"{os.getpid()}\n")
+        self.sessions.write("start", now_ms(), detail=" ".join(self.cfg.symbols))
         log.info("开始录制 %s -> %s", ",".join(self.cfg.symbols), self.cfg.out)
         async with aiohttp.ClientSession() as http:
             if self.cfg.fetch_meta:
                 await self.save_meta(http)
             periodic = asyncio.create_task(self.periodic())
             try:
-                await self.stream(http)
+                results = await asyncio.gather(*(self._stop_on_error(self.stream(http, c)) for c in CONNECTIONS),
+                                               return_exceptions=True)
+                for r in results:
+                    if isinstance(r, BaseException):
+                        raise r
             finally:
                 self.stop.set()
                 await periodic
                 self.writer.flush()
                 self.sessions.write("stop", now_ms())
+                pid_file.unlink(missing_ok=True)
                 log.info("已退出，共写入 %d 行", self.writer.rows_written)
 
 
@@ -402,6 +449,7 @@ def main(argv: list[str] | None = None) -> None:
     rec.add_argument("--max-rss-mb", type=float, default=150.0, help="常驻内存超过就停止")
     rec.add_argument("--min-free-gb", type=float, default=5.0, help="磁盘剩余低于就停止")
     rec.add_argument("--duration-hours", type=float, help="录多久后自动退出（默认一直录）")
+    rec.add_argument("--stats-minutes", type=float, default=10.0, help="多久打一次统计日志")
     sel = sub.add_parser("select", help="列出 tick 相对价格较大、成交额较高的品种")
     sel.add_argument("--min-volume", type=float, default=20e6, help="24h 成交额下限（USDT）")
     sel.add_argument("--min-tick-bp", type=float, default=1.0)
@@ -417,7 +465,8 @@ def main(argv: list[str] | None = None) -> None:
     cfg = RecorderConfig(symbols=[s.strip().upper() for s in args.symbols.split(",") if s.strip()],
                          out=Path(args.out).expanduser(), flush_seconds=args.flush_seconds,
                          qty_interval_ms=args.qty_interval_ms, max_rss_mb=args.max_rss_mb,
-                         min_free_gb=args.min_free_gb, duration_hours=args.duration_hours)
+                         min_free_gb=args.min_free_gb, duration_hours=args.duration_hours,
+                         stats_minutes=args.stats_minutes)
     asyncio.run(Recorder(cfg).run())
 
 

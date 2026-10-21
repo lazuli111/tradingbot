@@ -289,6 +289,9 @@ class SymbolAccumulator:
             "ask_lifts_per_h": per_h(n_touch_buy),
             "cleared_per_h": per_h(cleared["n"].sum()),
             "touch_usd_per_h": per_h(touch["notional"].sum()),
+            # 最优价上的成交额 / 买一+卖一挂单额：每小时把最优价那一档换手几遍，越大排到队首越快
+            "queue_turnover_per_h": (per_h(touch["notional"].sum()) / (self.depth_w.sum() / total)
+                                     if total and self.depth_w.sum() else float("nan")),
             "fill_spread_bp": touch["spread_bp"].sum() / n_touch if n_touch else float("nan"),
         }
         for name, sub in (("touch", touch), ("cleared", cleared)):

@@ -73,6 +73,7 @@ def main() -> int:
         "trades_per_h": "成交/小时", "touch_share": "touch 占比", "bid_hits_per_h": "打买一/小时",
         "ask_lifts_per_h": "吃卖一/小时", "cleared_per_h": "整档吃光/小时",
         "depth_bid_usd": "买一挂单额 (USD)", "touch_usd_per_h": "touch 成交额/小时 (USD)",
+        "queue_turnover_per_h": "最优档换手/小时",
     }))
     print("\n## markout（被动方，bp；乐观口径 = 所有 touch 成交）\n")
     cols = {"symbol": "品种", "fill_spread_bp": "成交时价差"}

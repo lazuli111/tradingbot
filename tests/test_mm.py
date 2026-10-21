@@ -34,10 +34,13 @@ def test_parse_book_ticker_keeps_strings_and_both_timestamps():
 
 
 def test_parse_agg_trade_maps_buyer_maker_and_fill_count():
-    kind, sym, row, _ = parse_message(trade_msg("SOLUSDT", 2002, 2001, 77, "150.5", "2", True), 2010)
+    msg = trade_msg("SOLUSDT", 2002, 2001, 77, "150.5", "2", True)
+    msg["data"]["nq"] = "1.5"
+    kind, sym, row, _ = parse_message(msg, 2010)
     assert kind == "aggTrade" and sym == "SOLUSDT"
-    assert row == "2002,2001,2010,77,150.5,2,1,3"  # m=true -> buyer_maker=1（主动卖），l-f+1=3
-    assert parse_message(trade_msg("SOLUSDT", 1, 1, 1, "1", "1", False), 5)[2].split(",")[6] == "0"
+    assert row == "2002,2001,2010,77,150.5,2,1.5,1,3"  # m=true -> buyer_maker=1（主动卖），l-f+1=3
+    row = parse_message(trade_msg("SOLUSDT", 1, 1, 1, "1", "1", False), 5)[2]
+    assert row.split(",")[6:8] == ["", "0"]  # 没有 nq 就留空
     assert len(row.split(",")) == len(HEADERS[kind].split(","))
 
 
@@ -46,9 +49,10 @@ def test_parse_unknown_event_is_ignored():
     assert parse_message({"result": None, "id": 1}, 0) is None
 
 
-def test_stream_url_lists_both_streams_per_symbol():
-    url = stream_url(["BTCUSDT", "SOLUSDT"])
-    assert url.endswith("btcusdt@bookTicker/btcusdt@aggTrade/solusdt@bookTicker/solusdt@aggTrade")
+def test_stream_urls_split_public_and_market():
+    assert stream_url(["BTCUSDT", "SOLUSDT"], "public") == \
+        "wss://fstream.binance.com/public/stream?streams=btcusdt@bookTicker/solusdt@bookTicker"
+    assert stream_url(["BTCUSDT"], "market").endswith("/market/stream?streams=btcusdt@aggTrade")
 
 
 def test_book_throttle_keeps_price_changes_and_samples_qty_only_changes():
@@ -64,11 +68,11 @@ def test_book_throttle_keeps_price_changes_and_samples_qty_only_changes():
 
 def test_writer_splits_by_hour_and_appends_gzip_members(tmp_path):
     w = HourlyGzipWriter(tmp_path)
-    w.add("aggTrade", "BTCUSDT", T0 + 10, "1,1,1,1,100,1,0,1")
-    w.add("aggTrade", "BTCUSDT", T0 + HOUR_MS - 1, "2,2,2,2,100,1,0,1")
-    w.add("aggTrade", "BTCUSDT", T0 + HOUR_MS, "3,3,3,3,100,1,1,1")
+    w.add("aggTrade", "BTCUSDT", T0 + 10, "1,1,1,1,100,1,1,0,1")
+    w.add("aggTrade", "BTCUSDT", T0 + HOUR_MS - 1, "2,2,2,2,100,1,1,0,1")
+    w.add("aggTrade", "BTCUSDT", T0 + HOUR_MS, "3,3,3,3,100,1,1,1,1")
     w.flush()
-    w.add("aggTrade", "BTCUSDT", T0 + 20, "4,4,4,4,100,1,0,1")  # 第二次刷盘：同一个文件追加
+    w.add("aggTrade", "BTCUSDT", T0 + 20, "4,4,4,4,100,1,1,0,1")  # 第二次刷盘：同一个文件追加
     w.flush()
     files = sorted((tmp_path / "aggTrade" / "BTCUSDT").iterdir())
     assert [f.name for f in files] == ["20251021-12.csv.gz", "20251021-13.csv.gz"]
@@ -82,11 +86,11 @@ def test_writer_splits_by_hour_and_appends_gzip_members(tmp_path):
 def test_reader_tolerates_truncated_last_member(tmp_path):
     w = HourlyGzipWriter(tmp_path)
     for i in range(3):
-        w.add("aggTrade", "X", T0, f"{i},{i},{i},{i},100,1,0,1")
+        w.add("aggTrade", "X", T0, f"{i},{i},{i},{i},100,1,1,0,1")
         w.flush()
     path = w.path("aggTrade", "X", T0 // HOUR_MS)
     good = path.read_bytes()
-    extra = gzip.compress(b"9,9,9,9,100,1,0,1\n" * 1000)
+    extra = gzip.compress(b"9,9,9,9,100,1,1,0,1\n" * 1000)
     path.write_bytes(good + extra[: len(extra) // 2])  # 模拟强杀：最后一个 member 写了一半
     df = fz.read_gz_csv(path)
     assert df["E"].tolist()[:3] == [0, 1, 2]
@@ -94,27 +98,39 @@ def test_reader_tolerates_truncated_last_member(tmp_path):
 
 
 def test_read_coverage_handles_reconnects_and_hard_kills():
-    lines = ["event,recv,detail", "start,0,", "connect,100,", "alive,500,", "alive,900,",
-             "disconnect,950,ws CLOSE", "connect,2000,", "alive,3000,",
+    lines = ["event,recv,conn,detail", "start,0,,", "connect,100,public,", "alive,500,public,",
+             "alive,900,public,", "disconnect,950,public,ws CLOSE", "connect,2000,public,", "alive,3000,public,",
              # 进程被强杀：没有 disconnect，下一次 start 时截在最后一次 alive
-             "start,9000,", "connect,9100,", "alive,9500,", "disconnect,9600,stop", "stop,9700,",
-             "connect,10000,", "disconnect,10000,never got data"]
+             "start,9000,,", "connect,9100,public,", "alive,9500,public,", "disconnect,9600,public,stop",
+             "stop,9700,,", "connect,10000,public,", "disconnect,9000,public,never got data"]
     assert read_coverage(lines) == [(100, 950), (2000, 3000), (9100, 9600)]
 
 
+def test_read_coverage_intersects_connections():
+    lines = ["event,recv,conn,detail", "start,0,,",
+             "connect,100,public,", "connect,150,market,", "alive,1000,public,", "alive,1000,market,",
+             "disconnect,400,market,ws CLOSE", "connect,600,market,", "alive,1200,market,",
+             "alive,1300,public,", "stop,1400,,"]
+    # public: 100~1300；market: 150~400、600~1200 -> 交集
+    assert read_coverage(lines) == [(150, 1000), (600, 1200)]
+
+
 def test_recorder_reconnects_and_stops_cleanly(tmp_path):
-    """本地假 websocket：第一条连接发几条消息后被服务器关掉，录制器应重连，停止时写完缓冲。"""
+    """本地假 websocket：第一条 public 连接发几条消息后被服务器关掉，录制器应重连，停止时写完缓冲。"""
     connections = []
 
     async def handler(request):
         ws = web.WebSocketResponse()
         await ws.prepare(request)
-        connections.append(request.path_qs)
-        n = len(connections)
-        await ws.send_str(json.dumps(book_msg("BTCUSDT", T0 + n, T0 + n, "100.0", "1", "100.1", "1")))
-        await ws.send_str("not json")  # 坏消息只记日志，不断线
-        await ws.send_str(json.dumps(trade_msg("BTCUSDT", T0 + n, T0 + n, n, "100.1", "1", False)))
-        if n == 1:
+        conn = request.match_info["conn"]
+        connections.append((conn, request.query_string))
+        n = sum(c == conn for c, _ in connections)
+        if conn == "public":
+            await ws.send_str(json.dumps(book_msg("BTCUSDT", T0 + n, T0 + n, "100.0", "1", "100.1", "1")))
+            await ws.send_str("not json")  # 坏消息只记日志，不断线
+        else:
+            await ws.send_str(json.dumps(trade_msg("BTCUSDT", T0 + n, T0 + n, n, "100.1", "1", False)))
+        if conn == "public" and n == 1:
             await ws.close()
         else:
             async for _ in ws:  # 读到客户端的 close 帧为止
@@ -123,33 +139,40 @@ def test_recorder_reconnects_and_stops_cleanly(tmp_path):
 
     async def scenario():
         app = web.Application()
-        app.router.add_get("/stream", handler)
+        app.router.add_get("/{conn}/stream", handler)
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, "127.0.0.1", 0)
         await site.start()
         port = site._server.sockets[0].getsockname()[1]
         rec = Recorder(RecorderConfig(symbols=["BTCUSDT"], out=tmp_path, flush_seconds=0.2,
-                                      ws_base=f"http://127.0.0.1:{port}/stream?streams=", fetch_meta=False,
+                                      ws_root=f"http://127.0.0.1:{port}", fetch_meta=False,
                                       max_rss_mb=1e6))  # pytest 进程本身已经超过 150MB
         task = asyncio.create_task(rec.run())
         for _ in range(100):
             await asyncio.sleep(0.1)
-            if len(connections) >= 2 and rec.counts["aggTrade"] >= 2:
+            if len(connections) >= 3 and rec.counts["bookTicker"] >= 2:
                 break
+        await asyncio.sleep(0.5)  # 让 alive 落盘
         rec.stop.set()  # 和 SIGTERM 处理函数做的事一样
         await asyncio.wait_for(task, 10)
         await runner.cleanup()
         return rec
 
     rec = asyncio.run(scenario())
-    assert len(connections) == 2 and "btcusdt@aggTrade" in connections[0]
+    assert sorted(connections) == [("market", "streams=btcusdt@aggTrade"),
+                                   ("public", "streams=btcusdt@bookTicker"),
+                                   ("public", "streams=btcusdt@bookTicker")]
     assert rec.bad_messages == 2 and rec.reconnects == 1
-    events = [l.split(",")[0] for l in (tmp_path / "sessions.csv").read_text().splitlines()[1:]]
-    assert events[0] == "start" and events[-1] == "stop"
-    assert events.count("connect") == 2 and events.count("disconnect") == 2
-    trades = fz.read_gz_csv(next((tmp_path / "aggTrade" / "BTCUSDT").iterdir()))
-    assert trades["agg_id"].tolist() == [1, 2]
+    assert not (tmp_path / "recorder.pid").exists()
+    rows = [l.split(",") for l in (tmp_path / "sessions.csv").read_text().splitlines()[1:]]
+    events = [(r[0], r[2]) for r in rows]
+    assert events[0] == ("start", "") and events[-1] == ("stop", "")
+    assert events.count(("connect", "public")) == 2 and events.count(("disconnect", "public")) == 2
+    assert events.count(("connect", "market")) == 1 and ("alive", "market") in events
+    book = fz.read_gz_csv(next((tmp_path / "bookTicker" / "BTCUSDT").iterdir()))
+    assert book["E"].tolist() == [T0 + 1, T0 + 2]
+    assert len(fz.read_gz_csv(next((tmp_path / "aggTrade" / "BTCUSDT").iterdir()))) == 1
 
 
 # ---------------------------------------------------------------- 分析：纯计算
@@ -262,13 +285,14 @@ def write_dataset(root, segments, book_rows, trade_rows, symbol="TESTUSDT", tick
     for T, bid, ask in book_rows:
         w.add("bookTicker", symbol, T + 5, f"{T},{T},{T + 5},{bid},2,{ask},3")
     for i, (T, price, buyer_maker) in enumerate(trade_rows):
-        w.add("aggTrade", symbol, T + 5, f"{T},{T},{T + 5},{i},{price},1,{buyer_maker},1")
+        w.add("aggTrade", symbol, T + 5, f"{T},{T},{T + 5},{i},{price},1,1,{buyer_maker},1")
     w.flush()
     log = SessionLog(root / "sessions.csv")
     for s, e in segments:
-        log.write("connect", s)
-        log.write("alive", e)
-        log.write("disconnect", e)
+        for conn in ("public", "market"):
+            log.write("connect", s, conn)
+            log.write("alive", e, conn)
+            log.write("disconnect", e, conn)
     (root / "meta.json").write_text(json.dumps({"symbols": {symbol: {"tickSize": tick, "stepSize": "1"}}}))
 
 
