@@ -15,8 +15,9 @@ Environment=OMP_NUM_THREADS=1
 ExecStart=/opt/tradingbot/.venv/bin/python main.py testnet --config config.portfolio.yaml --symbol BTC/USDT
 Restart=always
 RestartSec=30
-# 实测单进程 RSS ≈ 340 MB；留余量后硬顶 450 MB，超了重启这个服务而不是拖垮整机
-MemoryMax=450M
+# 软上限：超过后内核施压回收，不会杀进程。原来用 MemoryMax=450M 会在这个大
+# 内存页的进程上反复触发回收/重启，2 GB 实例上没必要那么紧。
+MemoryHigh=600M
 StandardOutput=append:/var/log/tradingbot-btc.log
 StandardError=append:/var/log/tradingbot-btc.log
 

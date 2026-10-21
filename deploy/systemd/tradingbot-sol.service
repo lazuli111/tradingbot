@@ -16,7 +16,8 @@ Environment=OMP_NUM_THREADS=1
 ExecStart=/opt/tradingbot/.venv/bin/python main.py testnet --config config.portfolio.yaml --symbol SOL/USDT
 Restart=always
 RestartSec=30
-MemoryMax=450M
+# 软上限：超过后内核施压回收，不会杀进程
+MemoryHigh=600M
 StandardOutput=append:/var/log/tradingbot-sol.log
 StandardError=append:/var/log/tradingbot-sol.log
 
