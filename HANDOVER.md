@@ -320,6 +320,27 @@ New-Item logs\forward_bot.stop
 - **Oracle Always Free 是当前最划算的**：2 OCPU + 12 GB ARM / 200 GB 盘 / 10 TB 出网（网上的 4/24 是旧数据）。但它的闲置回收规则是「7 天内 CPU、网络、内存 95 分位都低于 20% 就回收」——**交易机器人必然满足**，所以要么升级 Pay As You Go（Always Free 资源仍 $0），要么这台机器同时干点别的活。
 - 部署形态：`docker compose up -d` 起三个容器（BTC、SOL、guard），`restart: unless-stopped` 负责崩溃重启；不想装 Docker 就用 `deploy/systemd/` 下三个 unit。代码零改动。
 
+### 实际部署记录（2026-10-21，阿里云东京）
+
+- **机器**：阿里云轻量应用服务器，日本（东京），2 vCPU / 2 GiB，Ubuntu 24.04
+- **形态**：systemd + venv，不装 Docker；两个品种各一个服务，外加一个 5 分钟定时闸门
+- **服务**：`tradingbot-btc.service`、`tradingbot-sol.service`、`tradingbot-guard.timer`（oneshot + timer）
+- **实测**：单进程 RSS ≈ 356 MB，两品种 + 系统约 1.2 GB 占用，1 GB swap 兜底，load ≈ 0.2
+- **运维命令**（服务器上）：
+  ```bash
+  systemctl status tradingbot-btc tradingbot-sol
+  cd /opt/tradingbot && sudo -u tradingbot .venv/bin/python tools/forward_status.py
+  cd /opt/tradingbot && sudo -u tradingbot .venv/bin/python tools/portfolio_guard.py --status
+  sudo tail -f /var/log/tradingbot-btc.log
+  ```
+
+**踩过的坑（都付出过停机代价）**：
+
+1. **1 GiB 只能跑一个品种**。最初在 2 核 1 GiB 上同时起 btc + sol + 常驻 guard 三个 Python 进程，直接进 OOM/回收循环，load 冲到 41，连 sshd 都 fork 不出来，SSH 完全失联（两次）。升到 2 GiB 后同样配置稳定在 1.2 GB 占用。
+2. **`MemoryMax` 会害人**。给进程设 `MemoryMax=450M` 后，加载行情时的内存页反复触发回收/重启，反而更容易把机器拖死；换成 `MemoryHigh`（只施压不杀）才对。
+3. **闸门用 timer 不用常驻**。`portfolio_guard.py` 原本是 `--loop 60` 常驻，多背一个约 150 MB 的进程；改成 oneshot + timer 每 5 分钟一次，还顺手让它不 import pandas（少 ~120 MB）。
+4. **别把 `.env` 打包进构建产物**。有一次误把含 Key 的部署包 commit 了，虽然立刻 `git rm` + `--force-with-lease` 重写掉，但保险起见还是应该轮换 Demo Key。
+
 ## 代码结构
 
 三个引擎共用同一个决策核心：
