@@ -117,3 +117,26 @@ docker compose exec guard python tools/portfolio_guard.py --status   # 账户权
 
 - Oracle Always Free：$0（升级 PAYG 后 Always Free 资源仍为 $0，只是不再受闲置回收影响）
 - Vultr 东京：约 $6/月；Hetzner（欧洲）：约 €4/月；Contabo 新加坡：约 $5/月
+- 阿里云轻量（境外节点）：约 ¥24~40/月，支付宝付款
+
+## 10. 阿里云轻量应用服务器（支付宝付款）
+
+适合没有外币卡、想用支付宝结算的情况。**必须买境外节点**：中国大陆地域访问不了币安，还涉及备案。
+
+1. **购买**：aliyun.com → 轻量应用服务器 → 地域选 **日本（东京）**，没有就 **新加坡**；镜像 **Ubuntu 22.04**；套餐最低配（1 核 2 G 足够，机器人常驻只占 150~250 MB）。先买 1 个月试。
+2. **登录凭据**：创建时设 root 密码（或用"重置密码"），记下公网 IP。
+3. **防火墙**：控制台 → 防火墙，只保留 **22（SSH）**；80/443 都不需要。
+4. **连上去**：`ssh root@<公网IP>`
+5. **装 Docker**（境外节点可以直接拉，国内节点要换镜像源）：
+   ```bash
+   curl -fsSL https://get.docker.com | sh
+   ```
+6. **验网络**（三个必须 200，有 451 就换地域重建）：
+   ```bash
+   for u in https://api.binance.com/api/v3/ping https://fapi.binance.com/fapi/v1/ping https://demo-fapi.binance.com/fapi/v1/ping; do
+     echo "$u -> $(curl -s -o /dev/null -w '%{http_code}' --max-time 15 $u)"; done
+   ```
+7. 之后按本文第 3~6 节走：`apt install -y git` → 克隆 → `.env` → `config.portfolio.yaml` → `docker compose up -d --build`。
+
+轻量的带宽通常 1~3 Mbps 或按流量包计费，这套机器人每 4 小时只发几十个请求，一个月几百 MB，完全够用。
+
