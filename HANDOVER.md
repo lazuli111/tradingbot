@@ -17,7 +17,7 @@
 
 ## 当前状态
 
-策略、风控、回测、模拟盘和测试网下单都已经在真实数据 / 真实测试网账户上验证过，49 个单元测试全部通过。
+策略、风控、回测、模拟盘和测试网下单都已经在真实数据 / 真实测试网账户上验证过，70 个单元测试全部通过（含做市可行性的 21 个）。
 
 | 模块 | 状态 | 怎么验证的 / 为什么没验证 |
 | --- | --- | --- |
@@ -28,6 +28,7 @@
 | Binance 行情（K 线、资金费率历史） | **已验证** | 无 451；资金费历史从 2023-01 起完整，回测无“只提供…之后”警告 |
 | Binance Demo Trading 下单 | **已验证** | 现货买卖、永续开平（逐仓 + `reduceOnly`）、软止损、重启恢复全部在 Demo 账户上跑通 |
 | 前向验证（Demo 4h 永续） | **进行中** | 2026-10-20 起连续跑 2~4 周，BTC/USDT 4h，见[前向验证](#前向验证demo2-4-周) |
+| 盘口做市可行性（只录行情、不下单） | **录制中** | 东京服务器 2026-10-21 起录 7 天、17 个品种，见[做市可行性](#做市可行性第一阶段2026-10-21-起) |
 | 实盘交易 | 不支持 | 刻意不做：非测试网直接抛出 NotImplementedError |
 
 代码在 GitHub 私有仓库里，本文件随代码一起提交。
@@ -360,6 +361,10 @@ New-Item logs\forward_bot.stop
 执行 bot/broker/
   sim.py          回测 / 模拟盘本地撮合
   ccxt_broker.py  只连 Binance 模拟交易
+
+做市可行性 bot/mm/（独立，不接入上面的决策核心）
+  recorder.py     录制 bookTicker + aggTrade（只依赖 aiohttp，可单独拷到服务器）
+  feasibility.py  价差、touch 成交、markout、每个来回期望 <── tools/mm_feasibility.py
 ```
 
 每根 K 线收盘时，引擎先算策略信号，再交给 `trader.py` 结合风控做决定，最后由 broker 执行。从回测换到测试网，只是把 `sim.py` 换成 `ccxt_broker.py`。新策略只需实现 `raw_signals` 和 `base_warmup`，入场过滤由基类自动套用。
@@ -395,6 +400,46 @@ Binance 数据（含完整资金费）三币种复核，两个窗口：
 - **波动率过滤变差**：Binance 上 12 个格子里只有 2 个改善，默认关闭。
 
 这些结论的局限：只用了 3 个高度相关的币种（2021 起 5.8 年、2023 起 3.8 年），两个窗口都是上涨市，三币种都跑输买入持有；`max_drawdown: 0.20` 的永久熔断会把个别回测“截断”，读收益时要留意——ETH 就是被截断后才显示 −10%，放开熔断是 +13.9%。ADX 的收益贡献已经证明随区间翻转（见上表），所以不要再单看一个窗口下结论。下一个最有价值的检验是把品种扩到相关性更低的标的（例如主流山寨 / 指数），以及做组合层面的等权配置，而不是继续在 BTC/ETH/SOL 上调参数。
+
+## 做市可行性（第一阶段，2026-10-21 起）
+
+**问题**：在 Binance U 本位合约上，以普通账户的 maker 费率（0.02%，即 2bp）在买一/卖一两边挂单，有没有哪个品种的期望为正？这一阶段只录公开行情、离线分析，**不写做市引擎，也不下单**。
+
+### 怎么录的
+
+- 代码：`bot/mm/recorder.py`。只依赖标准库和 aiohttp，不需要 API Key。按小时写 gzip CSV（`<out>/bookTicker|aggTrade/<品种>/<YYYYMMDD-HH>.csv.gz`），保留交易所时间 `E`、`T` 和本地接收时间 `recv`。
+- **Binance 合约行情地址已经拆开（2026-10 实测）**：aggTrade 只在 `wss://fstream.binance.com/market/stream` 上推，旧的 `/stream` 一条都收不到；bookTicker 在 `/public/stream`。所以录制器开两条连接，有效时间取两条连接的交集。
+- bookTicker 每秒几百条（BTC 约 850 条/秒），大部分只是挂单量变化。录制规则：买一/卖一**价格**变了的行全部保留；只有量变的行，每个品种每秒最多留一行。这样会损失挂单量的细节，不影响价差和 markout。
+- 断线时按 1、2、4…60 秒退避重连。`sessions.csv` 记录每条连接的 connect / alive（每 15 秒一次）/ disconnect，分析时据此剔除空档：两端各缩 1 秒，查报价和 markout 都不跨段。进程被强杀时最多丢最后 15 秒，已经写入的 gzip member 仍然能读。
+- 自我保护：常驻内存超过 150MB，或磁盘剩余不到 5GB，就自己停下。收到 SIGTERM 时把缓冲区写完再退出。
+- 服务器上的运行方式（用户 2026-10-21 同意）：
+
+```bash
+# 在 tradingbot-tokyo 上，以 claude-ops 身份；代码在 ~/mm（不在 /opt/tradingbot）
+cd ~/mm && (setsid nohup nice -n 10 /opt/tradingbot/.venv/bin/python -m bot.mm.recorder record \
+    --out ~/mm/data --duration-hours 168 >> ~/mm/recorder.log 2>&1 < /dev/null &)
+kill -TERM $(cat ~/mm/data/recorder.pid)    # 提前停止；不要用 pkill -f，会把执行它的 ssh shell 一起杀掉
+```
+
+- 5 分钟试跑的结果：常驻内存 41MB，CPU 约 17%（2 vCPU 中的一个），磁盘约 10MB/小时（7 天约 1.6GB），零断线，`recv − E` 不超过 25ms。两个机器人服务不受影响（只读检查过 `is-active` 和日志）。
+
+### 分析口径（`bot/mm/feasibility.py`，入口 `tools/mm_feasibility.py`）
+
+```bash
+scp -r tradingbot-tokyo:mm/data data/mm
+python tools/mm_feasibility.py --data data/mm --maker-fee 0.0002 --csv reports/mm_feasibility.csv
+```
+
+- **价差**：按持续时间加权，以 tick 为单位精确统计，再按平均 tick_bp 折成 bp。
+- **主动成交**：`m=true` 是主动卖（打买一）。成交前报价取**严格早于**成交时间 T 的最后一行 bookTicker。
+- **touch 成交（乐观口径）**：成交价等于成交前的买一或卖一，这才是挂在最优价上的小单可能拿到的成交。BTC/ETH 约 69% 的成交和别的成交在同一毫秒内，是一张 taker 单连续扫多档（tick 只有 0.01~0.04bp），所以 touch 只占 38%；但每个毫秒里的第一笔有 0.91 是 touch，口径没有问题。乐观口径相当于假设自己总排在队首。
+- **整档吃光（悲观口径）**：touch 成交之后，同一毫秒内的报价显示这一档被打穿了。排在队尾的挂单只有在整档被吃光时才会成交，而这恰好是逆向选择最严重的情况。
+- **被动方 markout（h = 1/5/30/60 秒）**：`side × (p − m_h) / m0` = 半价差 − 逆向选择。价格朝 taker 的方向走，挂单方就亏。
+- **每个来回期望** = 2 × 平均被动 markout − 2 × maker 费 = 成交时价差 − 2 × 逆向选择 − 2 × maker 费。所有 horizon 用同一批成交（t+60 秒越过段尾的整笔剔除）。
+- **误差**：按小时分块计算聚类标准误（相邻成交的 markout 时间上重叠，逐笔当独立样本算会低估误差）。结论栏：乐观口径 ≤ 0 记“负”；为正但不到 2 倍标准误记“不显著”；悲观口径也为正才算“正”。
+- **打平所需 maker 费** = 乐观口径下每笔被动 markout，也就是费率降到多少时一个来回刚好不亏。可以用来对照 VIP 档位或返佣。
+
+<!-- MM_RESULTS -->
 
 ## 已知限制与合规提醒
 
