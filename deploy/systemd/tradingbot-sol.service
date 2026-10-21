@@ -1,5 +1,7 @@
 [Unit]
 Description=Trading bot forward test - SOL/USDT (Binance demo)
+# 注意：1 GB 内存的机器不要同时开 btc + sol，两个 Python 进程会互相挤爆（实测过）。
+# 想跑第二个品种，先把实例升到 2 GB，再加这个 unit 并把 config 里的 equity_fraction 改成 1/3 或 0.5。
 After=network-online.target
 Wants=network-online.target
 
@@ -9,9 +11,12 @@ User=tradingbot
 WorkingDirectory=/opt/tradingbot
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONIOENCODING=utf-8
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=OMP_NUM_THREADS=1
 ExecStart=/opt/tradingbot/.venv/bin/python main.py testnet --config config.portfolio.yaml --symbol SOL/USDT
 Restart=always
 RestartSec=30
+MemoryMax=450M
 StandardOutput=append:/var/log/tradingbot-sol.log
 StandardError=append:/var/log/tradingbot-sol.log
 

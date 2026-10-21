@@ -18,12 +18,28 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import ccxt  # noqa: E402
 from dotenv import load_dotenv  # noqa: E402
 
 from bot.config import api_credentials  # noqa: E402
-from bot.data import make_exchange  # noqa: E402
 
 STATE = Path("data/portfolio_guard.json")
+
+
+def make_demo_exchange(exchange_id: str, creds: dict):
+    """这里刻意不走 bot.data：那条路会 import pandas，常驻/定时跑一次要多占 ~120 MB，
+    而 1 GB 的机器上这个闸门每 5 分钟才跑一次，没必要背着数据栈。"""
+    ex = getattr(ccxt, exchange_id)({
+        "enableRateLimit": True,
+        "timeout": 20000,
+        "options": {"defaultType": "future", "adjustForTimeDifference": True},
+        **creds,
+    })
+    if exchange_id.startswith("binance") and hasattr(ex, "enable_demo_trading"):
+        ex.enable_demo_trading(True)
+    else:
+        ex.set_sandbox_mode(True)
+    return ex
 
 
 def now() -> str:
@@ -129,7 +145,7 @@ def main() -> int:
     if not {"apiKey", "secret"} <= creds.keys():
         print("缺少 API Key")
         return 1
-    ex = make_exchange(args.exchange, "perp", creds, testnet=True)
+    ex = make_demo_exchange(args.exchange, creds)
     ex.load_markets()
 
     if not args.loop:

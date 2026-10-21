@@ -1,19 +1,15 @@
 [Unit]
-Description=Trading bot portfolio guard (flatten + halt at -20% from peak)
+Description=Trading bot portfolio guard - one pass (flatten + halt at -20% from peak)
 After=network-online.target
-Wants=network-online.target
 
 [Service]
-Type=simple
+Type=oneshot
 User=tradingbot
 WorkingDirectory=/opt/tradingbot
-Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONIOENCODING=utf-8
-ExecStart=/opt/tradingbot/.venv/bin/python tools/portfolio_guard.py --loop 60
-Restart=always
-RestartSec=30
+Environment=OPENBLAS_NUM_THREADS=1
+# 故意做成 oneshot + timer：常驻会多背一个 ~150 MB 的 Python 进程，1 GB 的机器吃不消
+ExecStart=/opt/tradingbot/.venv/bin/python tools/portfolio_guard.py --once
+MemoryMax=300M
 StandardOutput=append:/var/log/tradingbot-guard.log
 StandardError=append:/var/log/tradingbot-guard.log
-
-[Install]
-WantedBy=multi-user.target

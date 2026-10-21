@@ -9,3 +9,4 @@ logs/
 config.*.yaml
 !config.forward.example.yaml
 !config.portfolio.example.yaml
+_deploy.tar.gz

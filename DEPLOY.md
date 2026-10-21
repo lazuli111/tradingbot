@@ -80,11 +80,15 @@ docker compose logs -f btc        # 应看到“已加载 301 根 K 线”和 K 
 sudo useradd -r -m -d /opt/tradingbot tradingbot
 sudo cp -r . /opt/tradingbot && sudo chown -R tradingbot:tradingbot /opt/tradingbot
 cd /opt/tradingbot && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-sudo cp deploy/systemd/*.service /etc/systemd/system/
+sudo cp deploy/systemd/*.service deploy/systemd/*.timer /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now tradingbot-btc tradingbot-sol tradingbot-guard
+sudo systemctl enable --now tradingbot-btc tradingbot-guard.timer
 journalctl -u tradingbot-btc -f
 ```
+
+> **1 GB 实例的实际情况（实测）**：一个机器人进程 RSS ≈ **340 MB**，加上系统和阿里云的 aegis 监控，1 GB 机器只剩不到 200 MB 余量。
+> 所以：**只开一个品种**，闸门用 `tradingbot-guard.timer`（每 5 分钟跑一次 `--once` 就退出），不要开 `tradingbot-guard.service` 的常驻模式，也不要同时开 `tradingbot-sol`。
+> 想跑两个品种，先把实例升到 2 GB。unit 里已经写了 `MemoryMax` 和 `OPENBLAS_NUM_THREADS=1`，超限只会重启那个服务，不会拖垮整机。
 
 ## 6. 上线当天验证（10 分钟）
 

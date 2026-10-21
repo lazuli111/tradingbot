@@ -9,9 +9,14 @@ User=tradingbot
 WorkingDirectory=/opt/tradingbot
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONIOENCODING=utf-8
+# 小机器上别让 numpy 的 OpenBLAS 起一堆线程
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=OMP_NUM_THREADS=1
 ExecStart=/opt/tradingbot/.venv/bin/python main.py testnet --config config.portfolio.yaml --symbol BTC/USDT
 Restart=always
 RestartSec=30
+# 实测单进程 RSS ≈ 340 MB；留余量后硬顶 450 MB，超了重启这个服务而不是拖垮整机
+MemoryMax=450M
 StandardOutput=append:/var/log/tradingbot-btc.log
 StandardError=append:/var/log/tradingbot-btc.log
 
