@@ -70,9 +70,11 @@ class LiveRunner:
             if mode == "testnet":  # size breakers against the real testnet balance
                 equity = broker.equity(self._last_price())
                 risk.peak_equity = risk.day_start_equity = equity
-        if mode == "testnet" and cfg.is_perp:
-            broker.sync_position()
         self.df: pd.DataFrame | None = None
+        self._needs_reconcile = False   # an error happened: check the position before going on
+        self._bar_unfinished = False    # the last closed bar wasn't fully processed
+        if mode == "testnet":  # the saved state may be stale (e.g. killed mid-order)
+            self._reconcile()
 
     def _make_broker(self) -> Broker:
         cfg = self.cfg
@@ -95,6 +97,13 @@ class LiveRunner:
         log.info("[%s] %s %.6f @ %.2f 手续费 %.4f 原因 %s%s", self.mode, fill.side, fill.qty,
                  fill.price, fill.fee, fill.reason, pnl)
         self.storage.record_fill(fill)
+
+    def _reconcile(self) -> None:
+        """perp: make the local position match the exchange's (the exchange wins, with a
+        warning). spot: the bot's holdings exist only locally, so this can only settle an
+        order whose outcome was unknown; it can't catch a position that drifted otherwise."""
+        self.trader.reconcile(int(time.time() * 1000), self._last_price())
+        self._needs_reconcile = False
 
     def _save(self) -> None:
         self.storage.save_state({"trader": self.trader.state(), "last_funding_ts": self.last_funding_ts})
@@ -139,7 +148,10 @@ class LiveRunner:
         return float(rates["rate"].sum())
 
     # ---- main loop -----------------------------------------------------
-    def _on_bar_closed(self) -> None:
+    def _on_bar_closed(self, reconciled: bool = False) -> None:
+        self._bar_unfinished = True
+        if not reconciled:
+            self._reconcile()
         signals = self.strategy.signals(self.df)
         atr = compute_atr(self.df, self.cfg.risk.atr_period)
         bar = self.df.iloc[-1]
@@ -148,35 +160,60 @@ class LiveRunner:
         equity = self.trader.on_bar_close(ts, float(bar["close"]), signal, atr_now)
         self.storage.record_equity(ts, equity)
         pos = self.trader.broker.position
+        stop = f"{pos.stop:.2f}" if pos and pos.stop is not None else "无"
         log.info("K 线收盘 %s close=%.2f 信号=%+d 权益=%.2f 持仓=%s", _fmt_ts(ts), bar["close"],
-                 signal, equity, f"{pos.side:+d} {pos.qty:.6f} 止损 {pos.stop:.2f}" if pos else "无")
+                 signal, equity, f"{pos.side:+d} {pos.qty:.6f} 止损 {stop}" if pos else "无")
 
         # the next bar has already opened: execute at the current price
         price = self._last_price()
         now = int(time.time() * 1000)
         self.trader.on_bar_open(now, price, self._funding_due(price))
         self._save()
+        self._bar_unfinished = False
+
+    def poll(self) -> bool:
+        """One pass of the main loop. Returns True if a new bar closed.
+
+        After an error the next pass first reconciles with the exchange, then redoes the
+        unfinished bar: the Trader acts on the reconciled position, so an order that did
+        go through isn't sent twice, and the retry comes ~poll_seconds later, not a bar later.
+        """
+        new_bar = False
+        try:
+            reconciled = self._needs_reconcile or bool(self.trader.broker.unresolved)
+            if reconciled:
+                self._reconcile()
+            price = self._last_price()
+            now = int(time.time() * 1000)
+            self.trader.check_exits(now, price, price, price)
+            new_bar = not self._new_closed_bars().empty
+            if new_bar or self._bar_unfinished:
+                if self._bar_unfinished and not new_bar:
+                    log.warning("重新处理上一根未完成的 K 线")
+                self._on_bar_closed(reconciled)
+            else:
+                if self.trader.pending is not None:  # was waiting on an unresolved order
+                    self.trader.execute_pending(now, price)
+                self._save()
+        except Exception:  # keep running through transient API errors
+            log.exception("本轮处理出错：下一轮先与交易所核对持仓，再重试")
+            self._needs_reconcile = True
+        return new_bar
 
     def run(self, max_bars: int | None = None) -> None:
         log.info("启动 %s 模式: %s %s %s 策略 %s", self.mode, self.cfg.exchange, self.symbol,
                  self.cfg.timeframe, self.strategy)
         self._load_history()
-        self._on_bar_closed()  # act on the latest closed bar right away
+        try:
+            self._on_bar_closed()  # act on the latest closed bar right away
+        except Exception:
+            log.exception("启动时处理最新 K 线出错：下一轮先与交易所核对持仓，再重试")
+            self._needs_reconcile = True
         processed = 0
         try:
             while max_bars is None or processed < max_bars:
                 time.sleep(self.cfg.live.poll_seconds)
-                try:
-                    price = self._last_price()
-                    now = int(time.time() * 1000)
-                    self.trader.check_exits(now, price, price, price)
-                    if not self._new_closed_bars().empty:
-                        self._on_bar_closed()
-                        processed += 1
-                    else:
-                        self._save()
-                except Exception:  # keep running through transient API errors
-                    log.exception("本轮处理出错，下一轮重试")
+                processed += self.poll()
         except KeyboardInterrupt:
             log.info("收到中断信号，保存状态后退出（持仓保持不变）")
         finally:

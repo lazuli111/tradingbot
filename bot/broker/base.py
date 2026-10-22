@@ -40,6 +40,8 @@ class BrokerStats:
 class Broker(ABC):
     position: Position | None
     stats: BrokerStats
+    # an order whose outcome couldn't be determined; no new orders until it's resolved
+    unresolved: dict | None = None
 
     @abstractmethod
     def equity(self, price: float) -> float:
@@ -59,14 +61,22 @@ class Broker(ABC):
     def apply_funding(self, rate: float, price: float, ts: int) -> None:
         pass
 
+    def reconcile(self, price: float, ts: int) -> Fill | None:
+        """Bring the local position in line with the account. Returns a Fill the Trader
+        hasn't seen yet (e.g. a position that turned out to be closed already), else None.
+        Local brokers are always in line."""
+        return None
+
     def _record_close(self, pos: Position, exit_price: float, ts: int, exit_fee: float,
-                      net_pnl: float, reason: str) -> None:
+                      net_pnl: float | None, reason: str) -> None:
         self.stats.closed_trades.append({
             "entry_ts": pos.opened_at, "exit_ts": ts,
             "side": "long" if pos.side == 1 else "short", "qty": pos.qty,
             "entry": pos.entry, "exit": exit_price,
             "fees": pos.entry_fee + exit_fee, "funding": pos.funding,
-            "pnl": net_pnl, "return_pct": net_pnl / (pos.qty * pos.entry), "reason": reason,
+            "pnl": net_pnl,
+            "return_pct": None if net_pnl is None else net_pnl / (pos.qty * pos.entry),
+            "reason": reason,
         })
 
     def state(self) -> dict:
