@@ -144,3 +144,64 @@ docker compose exec guard python tools/portfolio_guard.py --status   # 账户权
 
 轻量的带宽通常 1~3 Mbps 或按流量包计费，这套机器人每 4 小时只发几十个请求，一个月几百 MB，完全够用。
 
+
+## 11. 只读看板（`tools/dashboard.py`）
+
+在自己的电脑或手机上看服务器上的权益曲线、回撤、持仓、成交和运行健康度。
+
+**安全设计**
+- 只监听 `127.0.0.1:8765`，不开任何新端口，代码也拒绝绑定非回环地址；只能通过 SSH 隧道访问。
+- 只读：只有 GET，页面上没有下单、平仓、启停按钮；账本用 SQLite `mode=ro` 打开，不写、不锁机器人的 `portfolio.db`。
+- systemd 用 `DynamicUser=yes` 的临时用户运行，整个文件系统只读，`.env` / `.git` 不可见；不需要也读不到 API Key。浮动盈亏用 Binance Demo 的公开标记价接口计算。
+- 只认 `localhost` / `127.0.0.1` 的 Host 头（防 DNS rebinding），带 CSP、`X-Frame-Options: DENY`，页面不加载任何外部资源。
+
+**数据来源**：账本 `data/portfolio.db`（持仓、止损、K 线、成交）、`data/portfolio_guard.json`（峰值、停机状态）、`/var/log/tradingbot-guard.log`（账户总权益，每 5 分钟一行）、`/var/log/tradingbot-{btc,sol}.log`（ERROR、对账警告、最后一次 K 线处理）、`systemctl show`（服务和 guard 定时器状态）。
+
+**流量**：首次打开约 9 KB（gzip），之后每分钟拉一次约 3 KB 的快照；页面一直开着一天约 4 MB。服务端快照缓存 30 秒，多开几个页面也只采集一次。
+
+### 安装（admin 执行一次）
+
+```bash
+sudo -u tradingbot git -C /opt/tradingbot pull --ff-only
+sudo cp /opt/tradingbot/deploy/systemd/tradingbot-dashboard.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now tradingbot-dashboard
+systemctl status tradingbot-dashboard --no-pager          # active (running)，内存二三十 MB
+curl -s -H 'Host: 127.0.0.1:8765' http://127.0.0.1:8765/api/snapshot | head -c 300; echo
+```
+
+不影响两个机器人：不需要重启它们，看板挂了也只影响看板自己。
+
+### 打开看板
+
+**电脑**（保持这个终端开着，然后浏览器打开 http://127.0.0.1:8765 ）：
+
+```bash
+ssh -N -L 8765:127.0.0.1:8765 admin@8.216.9.170
+```
+
+**手机**：用支持端口转发的 SSH App（iOS / Android 都可用 Termius）：新建 Port Forwarding → Local，本地端口 `8765`，目标 `127.0.0.1:8765`，主机选这台服务器；连上后手机浏览器打开 `http://127.0.0.1:8765`。
+
+> 前提：服务器防火墙要放行你当前 IP 的 22 端口。手机网络 IP 常变，连不上先去阿里云控制台 → 防火墙看规则。SSH 建议只用密钥登录。
+
+### 怎么判断数据是否过期
+
+| 看哪里 | 正常 | 过期 / 异常 |
+| --- | --- | --- |
+| 顶部“数据生成于” | 1 分钟内（页面每 60 秒刷新） | 超过 2 分钟，或出现红色“连接看板服务失败”横条：SSH 隧道断了或看板服务停了，页面上是旧数据 |
+| “权益记录于” | 5 分钟内 | 超过 12 分钟：guard 没在跑（告警里会写） |
+| 机器人“距收盘” | 小于 4 小时 | 超过 4.5 小时（4h K 线 + 30 分钟余量）：机器人卡住了，告警标红 |
+| 告警区 | 只有提示 | 服务停止、guard 失败或停机、订单待核对、最近 24 小时的 ERROR / 对账警告都会列出 |
+
+账户总权益来自 guard 每 5 分钟查一次交易所的结果，和 `portfolio_guard.py --status` 的实时值最多差 5 分钟的行情波动。持仓、止损、成交和 `forward_status.py` 读的是同一个账本，应完全一致。
+
+### 更新与卸载
+
+```bash
+sudo -u tradingbot git -C /opt/tradingbot pull --ff-only && sudo systemctl restart tradingbot-dashboard
+sudo systemctl disable --now tradingbot-dashboard && sudo rm /etc/systemd/system/tradingbot-dashboard.service && sudo systemctl daemon-reload
+```
+
+不在服务器上时，本地调试可以 `python3 tools/dashboard.py --root /path/to/tradingbot --once` 打印一次快照 JSON。
+
+**要公网网址？** 不要改 `--host`（代码会拒绝）。必须在前面加带 HTTPS 和登录认证的反向代理（例如 Caddy + 域名 + basic auth / OAuth），并且只在防火墙里开 443；在那之前，SSH 隧道是唯一的访问方式。

@@ -1,0 +1,44 @@
+[Unit]
+Description=Trading bot read-only dashboard (127.0.0.1:8765, reach it via ssh -L)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 临时的无特权用户：读不到 .env（600 tradingbot），整个文件系统只读，账本不可能被写
+DynamicUser=yes
+WorkingDirectory=/opt/tradingbot
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+Environment=PYTHONDONTWRITEBYTECODE=1
+# 只用系统 python3 + 标准库，不加载 venv / pandas，常驻约 20 MB
+ExecStart=/usr/bin/python3 /opt/tradingbot/tools/dashboard.py --root /opt/tradingbot --host 127.0.0.1 --port 8765
+Restart=on-failure
+RestartSec=10
+
+ProtectSystem=strict
+ProtectHome=yes
+InaccessiblePaths=-/opt/tradingbot/.env -/opt/tradingbot/.env.save -/opt/tradingbot/.git
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# AF_UNIX 给 systemctl show 用（查服务状态），AF_INET/6 给本地监听和 Binance 公开标记价
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=120M
+CPUQuota=25%
+
+[Install]
+WantedBy=multi-user.target
