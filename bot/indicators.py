@@ -48,3 +48,19 @@ def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
 def rolling_percentile(series: pd.Series, lookback: int) -> pd.Series:
     """Percentile rank (0-1] of each value among the last `lookback` values, itself included."""
     return series.rolling(lookback, min_periods=lookback).rank(pct=True)
+
+
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """Wilder's Relative Strength Index (0-100); 50 when the window had no price change."""
+    delta = series.diff()
+    gain = wilder(delta.clip(lower=0), period)
+    loss = wilder(-delta.clip(upper=0), period)
+    total = (gain + loss).replace(0, np.nan)
+    return (100 * gain / total).where(total.notna() | gain.isna(), 50.0)
+
+
+def bollinger(series: pd.Series, period: int = 20, num_std: float = 2.0) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """(lower, middle, upper) Bollinger Bands, population standard deviation."""
+    mid = sma(series, period)
+    dev = series.rolling(period, min_periods=period).std(ddof=0)
+    return mid - num_std * dev, mid, mid + num_std * dev
