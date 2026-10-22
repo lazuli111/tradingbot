@@ -8,6 +8,8 @@
 1d K 线、fundingRate（每次结算一行）、premiumIndexKlines 1d（永续相对指数价的溢价，即基差）。
 品种清单来自 S3 目录列表，已下架的品种也在里面。月度文件只到上个月，所以面板截到最近一个完整月。
 
+成交额为 0 的日子（下架后的“僵尸”日线、停牌）全部置空，见 drop_dead_days。
+
 非加密资产剔除：指数合约（BTCDOM 等）、稳定币和黄金代币整列去掉；TradFi 合约（股票、商品，
 2025-12-11 起上线）的名字可能和以前下架的币重名，所以只去掉 TRADFI_SINCE 之后的数据。
 """
@@ -194,9 +196,26 @@ def build_panels(root: Path, symbols: list[str] | None = None) -> dict[str, pd.D
     symbols = symbols or sorted(p.name for p in (root / "raw" / "klines").iterdir() if p.is_dir())
     per = {s: load_symbol(root, s) for s in symbols}
     panels = {f: pd.DataFrame({s: d[f] for s, d in per.items() if f in d}).sort_index() for f in FIELDS}
-    panels = exclude_non_crypto(panels)
-    pd.to_pickle(panels, root / "panels.pkl")
+    panels = exclude_non_crypto(drop_dead_days(panels))
+    tmp = root / "panels.pkl.part"   # 先写临时文件再改名，别的进程不会读到写了一半的文件
+    pd.to_pickle(panels, tmp)
+    tmp.replace(root / "panels.pkl")
     return panels
+
+
+def drop_dead_days(panels: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:
+    """成交额为 0 的日子所有字段置空。
+
+    data.binance.vision 在品种下架后还会继续生成成交额为 0、价格不变的日线（例如 FTT、BTCST、FTM
+    一直延续到 2026 年），停牌日也一样。不去掉的话，下架品种会被当成还在交易，回测里既不会强平，
+    也可能被选进可交易池。
+    """
+    dead = ~(panels["quote_volume"] > 0)
+    out = {}
+    for f, df in panels.items():
+        mask = dead.reindex(index=df.index, columns=df.columns, fill_value=True)
+        out[f] = df.mask(mask)
+    return out
 
 
 def exclude_non_crypto(panels: dict[str, pd.DataFrame]) -> dict[str, pd.DataFrame]:

@@ -176,6 +176,18 @@ def test_exclude_non_crypto_keeps_pre_tradfi_history():
     assert out["MDTUSDT"].tolist()[0] == 3.0 and np.isnan(out["MDTUSDT"].iloc[1])  # 重名的 TradFi 只去掉之后
 
 
+def test_drop_dead_days_ends_delisted_symbol_at_last_real_trade():
+    idx = pd.date_range("2024-01-01", periods=5)
+    panels = {
+        "close": pd.DataFrame({"X": [1.0, 1.1, 1.2, 1.2, 1.2]}, index=idx),
+        "quote_volume": pd.DataFrame({"X": [5.0, 6.0, 7.0, 0.0, 0.0]}, index=idx),
+        "funding": pd.DataFrame({"X": [0.001] * 5}, index=idx),
+    }
+    out = uv.drop_dead_days(panels)
+    assert out["close"]["X"].last_valid_index() == idx[2]
+    assert out["funding"]["X"].isna().tolist() == [False, False, False, True, True]
+
+
 def test_point_in_time_universe_uses_only_past_volume():
     idx = pd.date_range("2022-11-01", "2023-05-31")
     close = pd.DataFrame(1.0, index=idx, columns=["OLD", "BIG", "NEW", "GONE"])
