@@ -34,6 +34,10 @@ def fmt_table(df: pd.DataFrame, cols: dict[str, str], digits: int = 2) -> str:
     return "\n".join(lines)
 
 
+def utc_ms(text: str | None) -> int | None:
+    return None if text is None else int(pd.Timestamp(text, tz="UTC").value // 1_000_000)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="盘口做市可行性分析")
     ap.add_argument("--data", default="data/mm", help="recorder 的输出目录")
@@ -42,6 +46,8 @@ def main() -> int:
     ap.add_argument("--horizons", default="1,5,30,60", help="markout 秒数")
     ap.add_argument("--verdict-horizon", type=int, default=30, help="结论用哪个 horizon 的逆向选择")
     ap.add_argument("--chunk-hours", type=int, default=24, help="每次读多少小时（控制内存）")
+    ap.add_argument("--since", help="只分析这个时间之后，UTC，如 2026-10-21T14:35")
+    ap.add_argument("--until", help="只分析这个时间之前，UTC")
     ap.add_argument("--csv", help="把完整结果另存为 CSV")
     args = ap.parse_args()
 
@@ -49,11 +55,11 @@ def main() -> int:
     if args.verdict_horizon not in horizons:
         ap.error("--verdict-horizon 必须在 --horizons 里")
     params = Params(maker_fee=args.maker_fee, horizons=horizons, verdict_horizon=args.verdict_horizon,
-                    chunk_hours=args.chunk_hours)
+                    chunk_hours=args.chunk_hours, since_ms=utc_ms(args.since), until_ms=utc_ms(args.until))
     symbols = [s.strip().upper() for s in args.symbols.split(",")] if args.symbols else None
     root = Path(args.data)
 
-    cov = coverage_report(root, params.gap_margin_ms)
+    cov = coverage_report(root, params.gap_margin_ms, params.since_ms, params.until_ms)
     df = analyze(root, symbols, params, log=lambda m: print(m, file=sys.stderr))
     if df.empty:
         print("没有可分析的数据")

@@ -326,6 +326,11 @@ def test_end_to_end_negative_when_every_fill_is_picked_off(tmp_path):
     assert r["breakeven_fee_bp"] < 0
     cov = fz.coverage_report(tmp_path)
     assert cov["segments"] == 2 and cov["gap_s_total"] == pytest.approx(600)
+    # --until 截掉断线之后的那一段：只剩第一段里的成交
+    first = fz.analyze(tmp_path, None, fz.Params(horizons=(1, 5), verdict_horizon=5, chunk_hours=1,
+                                                 until_ms=gap[0]), log=lambda m: None).iloc[0]
+    assert 0 < first["valid_trades"] < r["valid_trades"]
+    assert fz.coverage_report(tmp_path, until_ms=gap[0])["segments"] == 1
 
 
 def test_end_to_end_positive_when_price_never_moves(tmp_path):

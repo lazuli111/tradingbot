@@ -42,6 +42,8 @@ class Params:
     verdict_horizon: int = 30
     gap_margin_ms: int = 1000
     chunk_hours: int = 24
+    since_ms: int | None = None        # 只分析这个时间段（毫秒 UTC），比如剔除网络被限速的时段
+    until_ms: int | None = None
 
     @property
     def fee_bp(self) -> float:
@@ -89,12 +91,15 @@ def hour_files(root: Path, kind: str, symbol: str) -> dict[int, Path]:
     return {hour_index(p.name[:11]): p for p in sorted(d.glob("*.csv.gz"))} if d.exists() else {}
 
 
-def load_coverage(root: Path, margin_ms: int) -> np.ndarray:
-    """有效时间段 [[start, end], ...]（毫秒），两端各缩 margin_ms。"""
+def load_coverage(root: Path, margin_ms: int, since_ms: int | None = None,
+                  until_ms: int | None = None) -> np.ndarray:
+    """有效时间段 [[start, end], ...]（毫秒），两端各缩 margin_ms，再截到 [since_ms, until_ms]。"""
     path = root / "sessions.csv"
     if not path.exists():
         return np.empty((0, 2), dtype=np.int64)
-    segs = [(s + margin_ms, e - margin_ms) for s, e in read_coverage(path.read_text().splitlines())]
+    lo, hi = since_ms if since_ms is not None else -2**62, until_ms if until_ms is not None else 2**62
+    segs = [(max(s + margin_ms, lo), min(e - margin_ms, hi))
+            for s, e in read_coverage(path.read_text().splitlines())]
     return np.array([s for s in segs if s[1] > s[0]], dtype=np.int64).reshape(-1, 2)
 
 
@@ -330,7 +335,7 @@ def analyze_symbol(root: Path, symbol: str, params: Params, log=print) -> dict |
     trades = hour_files(root, "aggTrade", symbol)
     if not books:
         return None
-    segs = load_coverage(root, params.gap_margin_ms)
+    segs = load_coverage(root, params.gap_margin_ms, params.since_ms, params.until_ms)
     if len(segs) == 0:
         log(f"{symbol}: 没有 sessions.csv 或有效时间段，跳过")
         return None
@@ -375,8 +380,9 @@ def analyze(root: Path, symbols: list[str] | None, params: Params, log=print) ->
     return pd.DataFrame(rows)
 
 
-def coverage_report(root: Path, margin_ms: int = 0) -> dict:
-    segs = load_coverage(Path(root), margin_ms)
+def coverage_report(root: Path, margin_ms: int = 0, since_ms: int | None = None,
+                    until_ms: int | None = None) -> dict:
+    segs = load_coverage(Path(root), margin_ms, since_ms, until_ms)
     if len(segs) == 0:
         return {"segments": 0}
     total = segs[-1, 1] - segs[0, 0]
