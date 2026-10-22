@@ -27,13 +27,20 @@ class BacktestResult:
     metrics: dict
 
 
-def funding_per_bar(df: pd.DataFrame, funding: pd.DataFrame | None) -> np.ndarray:
-    """Sum of funding rates whose timestamp falls inside each bar [open, next open)."""
+def funding_per_bar(df: pd.DataFrame, funding: pd.DataFrame | None, bar_ms: int | None = None) -> np.ndarray:
+    """Sum of funding rates whose timestamp falls inside each bar [open, next open).
+
+    Settlements before the first bar or after the last bar closes are dropped, so a
+    slice of the history (walk-forward windows) can be passed the full funding table."""
     out = np.zeros(len(df))
-    if funding is None or funding.empty:
+    if funding is None or funding.empty or df.empty:
         return out
-    idx = np.searchsorted(df["timestamp"].to_numpy(), funding["timestamp"].to_numpy(), side="right") - 1
-    valid = idx >= 0
+    ts = df["timestamp"].to_numpy()
+    if bar_ms is None:
+        bar_ms = int(np.median(np.diff(ts))) if len(ts) > 1 else 0
+    f_ts = funding["timestamp"].to_numpy()
+    idx = np.searchsorted(ts, f_ts, side="right") - 1
+    valid = (idx >= 0) & (f_ts < ts[-1] + bar_ms)
     np.add.at(out, idx[valid], funding["rate"].to_numpy()[valid])
     return out
 
@@ -44,7 +51,7 @@ def run_backtest(cfg: Config, df: pd.DataFrame, funding: pd.DataFrame | None = N
     strategy = create_strategy(cfg.strategy.name, cfg.strategy.params)
     signals = strategy.signals(df).fillna(0).astype(int).to_numpy()
     atr = compute_atr(df, cfg.risk.atr_period).to_numpy()
-    funding_rates = funding_per_bar(df, funding if cfg.is_perp else None)
+    funding_rates = funding_per_bar(df, funding if cfg.is_perp else None, timeframe_ms(cfg.timeframe))
 
     broker = SimBroker(cfg.is_perp, cfg.initial_equity, cfg.fee_rate, cfg.slippage,
                        cfg.risk.leverage if cfg.is_perp else 1.0, cfg.maintenance_margin_rate)

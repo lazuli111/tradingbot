@@ -56,6 +56,33 @@ def test_funding_mapped_to_bars():
     assert out[0] == pytest.approx(0.1) and out[3] == pytest.approx(0.5) and out.sum() == pytest.approx(0.6)
 
 
+def test_funding_after_the_last_bar_is_dropped():
+    """A slice of the history (a walk-forward window) gets the full funding table: settlements
+    after the slice ends must not pile up on its last bar."""
+    df = make_ohlcv(np.full(10, 100.0))
+    t_last = int(df["timestamp"].iloc[-1])
+    funding = pd.DataFrame({"timestamp": [t_last, t_last + HOUR - 1, t_last + HOUR, t_last + 50 * HOUR],
+                            "rate": [0.1, 0.2, 5.0, 7.0]})
+    out = funding_per_bar(df, funding)
+    assert out[-1] == pytest.approx(0.3) and out.sum() == pytest.approx(0.3)
+    assert funding_per_bar(df, funding, HOUR)[-1] == pytest.approx(0.3)
+
+
+def test_walk_forward_slice_funding_matches_trimmed_table():
+    """Backtesting a slice with the full funding table == with the table cut to the slice."""
+    from bot.config import Config
+    closes = 100 * np.exp(np.cumsum(np.random.default_rng(1).normal(0, 0.01, 400)))
+    df = make_ohlcv(closes)
+    ts = df["timestamp"].to_numpy()
+    funding = pd.DataFrame({"timestamp": np.arange(ts[0], ts[-1] + 1000 * HOUR, 8 * HOUR), "rate": 0.001})
+    cfg = Config(market="perp", timeframe="1h")
+    part = df.iloc[:250]
+    full = run_backtest(cfg, part, funding)
+    trimmed = run_backtest(cfg, part, funding[funding["timestamp"] <= ts[249]])
+    assert full.metrics["funding"] == pytest.approx(trimmed.metrics["funding"])
+    assert full.equity.iloc[-1] == pytest.approx(trimmed.equity.iloc[-1])
+
+
 def test_config_validation():
     with pytest.raises(ValueError):
         make_cfg(market="spot", risk=RiskConfig(leverage=2))
