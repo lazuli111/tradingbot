@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>交易看板</title>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f4f4f2; --surface: #fcfcfb; --text: #0b0b0b; --text-2: #52514e; --muted: #7a7974;
+  --grid: #e1e0d9; --border: rgba(11,11,11,0.10);
+  --series: #2a78d6; --series-fill: rgba(42,120,214,0.10);
+  --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
+  --pos: #0a7d0a; --neg: #c03030;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #111110; --surface: #1a1a19; --text: #f0efec; --text-2: #c3c2b7; --muted: #8f8e86;
+    --grid: #2c2c2a; --border: rgba(255,255,255,0.10);
+    --series: #3987e5; --series-fill: rgba(57,135,229,0.16);
+    --pos: #4cc24c; --neg: #ef7272;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #111110; --surface: #1a1a19; --text: #f0efec; --text-2: #c3c2b7; --muted: #8f8e86;
+  --grid: #2c2c2a; --border: rgba(255,255,255,0.10);
+  --series: #3987e5; --series-fill: rgba(57,135,229,0.16);
+  --pos: #4cc24c; --neg: #ef7272;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+main { max-width: 1080px; margin: 0 auto; padding: 16px; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px; margin-bottom: 12px; }
+h1 { font-size: 20px; margin: 0; }
+h2 { font-size: 15px; margin: 0 0 10px; }
+.meta { color: var(--text-2); font-size: 13px; }
+.num { font-variant-numeric: tabular-nums; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin-bottom: 12px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 12px; }
+.tile { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+.tile .label { color: var(--text-2); font-size: 12px; }
+.tile .value { font-size: 22px; font-weight: 600; margin-top: 2px; }
+.tile .sub { color: var(--text-2); font-size: 12px; margin-top: 2px; }
+.pos { color: var(--pos); } .neg { color: var(--neg); }
+.badge { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; padding: 1px 8px;
+  border-radius: 999px; border: 1px solid var(--border); color: var(--text); white-space: nowrap; }
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: none; }
+.lv-good .dot { background: var(--good); } .lv-warning .dot { background: var(--warning); }
+.lv-serious .dot { background: var(--serious); } .lv-critical .dot { background: var(--critical); }
+.lv-info .dot { background: var(--muted); }
+#banner { display: none; border-left: 4px solid var(--critical); }
+.alerts { list-style: none; margin: 0; padding: 0; }
+.alerts li { display: flex; gap: 8px; align-items: baseline; padding: 3px 0; }
+.alerts li .dot { position: relative; top: -1px; }
+.bots { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
+.bots .card { margin-bottom: 0; }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; margin: 0; }
+.kv dt { color: var(--text-2); } .kv dd { margin: 0; text-align: right; }
+.bot-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.bot-head h2 { margin: 0; }
+details { margin-top: 8px; } summary { cursor: pointer; color: var(--text-2); }
+.loglist { list-style: none; padding: 0; margin: 6px 0 0; font-size: 12px; }
+.loglist li { padding: 4px 0; border-top: 1px solid var(--grid); word-break: break-word; }
+.loglist .t { color: var(--muted); margin-right: 6px; }
+.loglist .d { color: var(--text-2); display: block; }
+.tablewrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { padding: 5px 8px; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--grid); }
+th { color: var(--text-2); font-weight: 500; }
+th:first-child, td:first-child, th:nth-child(2), td:nth-child(2), th:nth-child(3), td:nth-child(3),
+th:last-child, td:last-child { text-align: left; }
+.chartwrap { position: relative; }
+svg { display: block; width: 100%; height: 260px; }
+.axis text { fill: var(--muted); font-size: 11px; }
+.gridline { stroke: var(--grid); stroke-width: 1; }
+#tip { position: absolute; pointer-events: none; display: none; background: var(--surface); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font-size: 12px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.12); white-space: nowrap; }
+#tip b { font-size: 13px; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--text-2); margin-top: 6px; }
+.legend i { display: inline-block; width: 16px; height: 0; border-top: 2px solid; vertical-align: middle; margin-right: 4px; }
+button { font: inherit; font-size: 13px; padding: 3px 12px; border-radius: 6px; border: 1px solid var(--border);
+  background: var(--surface); color: var(--text); cursor: pointer; }
+footer { color: var(--muted); font-size: 12px; margin-top: 16px; }
+footer p { margin: 4px 0; }
+.empty { color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>交易看板</h1>
+    <span id="overall" class="badge lv-info"><span class="dot"></span><span>加载中</span></span>
+    <span class="meta">数据生成于 <span id="gen" class="num">—</span>（<span id="age">—</span>）</span>
+    <button id="refresh" type="button">刷新</button>
+  </header>
+
+  <div id="banner" class="card"></div>
+  <div id="alerts-card" class="card"><h2>告警</h2><ul id="alerts" class="alerts"></ul></div>
+
+  <section class="tiles" id="tiles"></section>
+
+  <div class="card">
+    <h2>账户总权益（Binance Demo，guard 每 5 分钟记录一次）</h2>
+    <div class="chartwrap">
+      <svg id="chart" role="img" aria-label="账户权益曲线"></svg>
+      <div id="tip"></div>
+    </div>
+    <div class="legend" id="legend"></div>
+  </div>
+
+  <section class="bots" id="bots"></section>
+
+  <div class="card" style="margin-top:12px">
+    <h2>成交记录</h2>
+    <div class="tablewrap"><table>
+      <thead><tr><th>时间</th><th>品种</th><th>方向</th><th>数量</th><th>价格</th><th>手续费</th><th>盈亏</th><th>原因</th></tr></thead>
+      <tbody id="fills"></tbody>
+    </table></div>
+  </div>
+
+  <div class="card">
+    <h2>组合 guard</h2>
+    <dl class="kv" id="guard"></dl>
+    <details><summary>guard 事件（清仓、检查失败）</summary><ul class="loglist" id="guard-events"></ul></details>
+  </div>
+
+  <footer>
+    <p>只读看板：没有任何下单、平仓或启停服务的操作。页面每 60 秒自动刷新，服务端快照最多缓存 30 秒。</p>
+    <p>判断数据是否过期：顶部“数据生成于”超过 2 分钟（或显示连接失败）说明看板服务或 SSH 隧道断了；
+       账户权益的“记录于”超过 12 分钟说明 guard 没在跑；机器人 K 线收盘后超过 4.5 小时没有新 K 线说明机器人卡住了。以上都会在“告警”里标出。</p>
+    <p>时间均为本机时区；K 线开收盘时间另附 UTC。</p>
+  </footer>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const REFRESH_MS = 60000, STALE_PAGE_MS = 120000;
+const LEVEL_TEXT = { good: "正常", info: "提示", warning: "注意", serious: "警告", critical: "严重" };
+let snap = null, lastOk = 0, failMsg = "";
+
+function h(tag, attrs, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === "class") el.className = v; else el.setAttribute(k, v);
+  }
+  for (const k of kids.flat()) if (k != null) el.append(k instanceof Node ? k : String(k));
+  return el;
+}
+function svg(tag, attrs) {
+  const el = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [k, v] of Object.entries(attrs || {})) el.setAttribute(k, v);
+  return el;
+}
+const pad = (n) => String(n).padStart(2, "0");
+function fmtTime(ms, withYear) {
+  if (ms == null) return "—";
+  const d = new Date(ms);
+  const s = `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  return withYear ? `${d.getFullYear()}-${s}` : s;
+}
+function fmtUtc(ms) {
+  const d = new Date(ms);
+  return `${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())} UTC`;
+}
+function ago(ms) {
+  if (ms == null) return "—";
+  const s = Math.max(0, (Date.now() - ms) / 1000);
+  if (s < 90) return `${Math.round(s)} 秒前`;
+  if (s < 5400) return `${Math.round(s / 60)} 分钟前`;
+  if (s < 172800) return `${(s / 3600).toFixed(1)} 小时前`;
+  return `${(s / 86400).toFixed(1)} 天前`;
+}
+const num = (v, d = 2) => v == null ? "—" : Number(v).toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+const pct = (v, d = 2) => v == null ? "—" : `${v >= 0 ? "+" : "−"}${Math.abs(v * 100).toFixed(d)}%`;
+const signed = (v, d = 2) => v == null ? "—" : `${v >= 0 ? "+" : "−"}${num(Math.abs(v), d)}`;
+const tone = (v) => v == null || v === 0 ? "" : (v > 0 ? "pos" : "neg");
+function qtyFmt(q) { return q == null ? "—" : String(+Number(q).toPrecision(8)); }
+function badge(level, text) {
+  return h("span", { class: `badge lv-${level}` }, h("span", { class: "dot" }), text || LEVEL_TEXT[level]);
+}
+
+async function load() {
+  try {
+    const r = await fetch("/api/snapshot", { cache: "no-store" });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    snap = await r.json();
+    lastOk = Date.now(); failMsg = "";
+  } catch (e) {
+    failMsg = `连接看板服务失败（${e.message}）。SSH 隧道可能断了；下面是 ${lastOk ? fmtTime(lastOk) : "—"} 拿到的数据。`;
+  }
+  render();
+}
+
+function render() {
+  const banner = $("banner");
+  if (failMsg) { banner.style.display = "block"; banner.textContent = failMsg; }
+  else banner.style.display = "none";
+  if (!snap) return;
+  $("gen").textContent = fmtTime(snap.generated_at, true);
+  $("age").textContent = ago(snap.generated_at);
+
+  const alerts = [...snap.alerts];
+  if (Date.now() - snap.generated_at > STALE_PAGE_MS)
+    alerts.unshift({ level: "serious", text: `看板数据已 ${ago(snap.generated_at)} 没有更新` });
+  const worst = alerts.find((a) => a.level !== "info");
+  const ov = $("overall");
+  ov.replaceWith(Object.assign(worst ? badge(worst.level, LEVEL_TEXT[worst.level]) : badge("good", "一切正常"), { id: "overall" }));
+  const ul = $("alerts");
+  ul.replaceChildren(...alerts.map((a) => h("li", { class: `lv-${a.level}` }, h("span", { class: "dot" }),
+    h("span", {}, `${LEVEL_TEXT[a.level]}：`, a.text))));
+  $("alerts-card").style.display = alerts.length ? "" : "none";
+
+  renderTiles(snap.account);
+  renderChart(snap);
+  renderBots(snap);
+  renderFills(snap.fills);
+  renderGuard(snap);
+}
+
+function tile(label, value, sub, cls) {
+  return h("div", { class: "tile" }, h("div", { class: "label" }, label),
+    h("div", { class: `value num ${cls || ""}` }, value), h("div", { class: "sub num" }, sub));
+}
+function renderTiles(a) {
+  const el = $("tiles");
+  if (!a) { el.replaceChildren(tile("账户权益", "—", "guard 日志里还没有记录")); return; }
+  const stale = Date.now() - a.as_of > snap.thresholds.guard_stale_min * 60000;
+  el.replaceChildren(
+    tile("账户总权益 (USDT)", num(a.equity),
+      h("span", {}, h("span", { class: tone(a.return) }, pct(a.return)), ` 自 ${fmtTime(a.start_ts)} 起（${num(a.start_equity)}）`)),
+    tile("相对峰值回撤", pct(a.drawdown), `峰值 ${num(a.peak)}`, a.drawdown < 0 ? "neg" : ""),
+    tile(`离 guard 熔断线（回撤 −${(a.max_dd * 100).toFixed(0)}%）`, `还差 ${(a.distance_pct * 100).toFixed(2)} 点`,
+      `再亏 ${num(a.distance)} USDT 触发 · 熔断线 ${num(a.guard_line)}`, a.distance_pct < 0.05 ? "neg" : ""),
+    tile("持仓 / 可用", `${a.positions} 个`, `可用 ${num(a.free)} USDT`),
+    tile("权益记录于", ago(a.as_of), h("span", {}, fmtTime(a.as_of, true), stale ? " · ⚠ 已过期" : ""), stale ? "neg" : ""),
+  );
+}
+
+function renderChart(s) {
+  const el = $("chart"), a = s.account, pts = s.curve;
+  const legend = $("legend");
+  el.replaceChildren();
+  legend.replaceChildren();
+  if (!a || pts.length < 2) {
+    const t = svg("text", { x: 10, y: 30, fill: "currentColor" }); t.textContent = "数据点不足，暂无曲线";
+    el.append(t); return;
+  }
+  const W = el.clientWidth || 600, H = 260, L = 58, R = 12, T = 12, B = 26;
+  el.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  const t0 = pts[0][0], t1 = pts[pts.length - 1][0];
+  let lo = Math.min(...pts.map((p) => p[1])), hi = Math.max(a.peak, ...pts.map((p) => p[1]));
+  const guardIn = a.guard_line >= lo - (hi - lo) * 0.6;  // 熔断线离得不远才画进图里，否则会把曲线压扁
+  if (guardIn) lo = Math.min(lo, a.guard_line);
+  const span = (hi - lo) || 1; lo -= span * 0.08; hi += span * 0.08;
+  const x = (t) => L + (t1 === t0 ? 0 : (t - t0) / (t1 - t0)) * (W - L - R);
+  const y = (v) => T + (hi - v) / (hi - lo) * (H - T - B);
+
+  const g = svg("g", { class: "axis" });
+  const step = niceStep((hi - lo) / 4);
+  for (let v = Math.ceil(lo / step) * step; v <= hi; v += step) {
+    g.append(svg("line", { class: "gridline", x1: L, x2: W - R, y1: y(v), y2: y(v) }));
+    const t = svg("text", { x: L - 6, y: y(v) + 4, "text-anchor": "end" }); t.textContent = num(v, step < 1 ? 1 : 0); g.append(t);
+  }
+  const ticks = Math.max(2, Math.min(6, Math.floor((W - L - R) / 110)));
+  for (let i = 0; i <= ticks; i++) {
+    const tt = t0 + (t1 - t0) * i / ticks;
+    const t = svg("text", { x: x(tt), y: H - 8, "text-anchor": i === 0 ? "start" : i === ticks ? "end" : "middle" });
+    t.textContent = fmtTime(tt); g.append(t);
+  }
+  el.append(g);
+
+  const line = pts.map((p, i) => `${i ? "L" : "M"}${x(p[0]).toFixed(1)},${y(p[1]).toFixed(1)}`).join("");
+  el.append(svg("path", { d: `${line}L${x(t1)},${H - B}L${x(t0)},${H - B}Z`, fill: "var(--series-fill)" }));
+  el.append(svg("line", { x1: L, x2: W - R, y1: y(a.peak), y2: y(a.peak), stroke: "var(--muted)", "stroke-width": 1, "stroke-dasharray": "4 3" }));
+  if (guardIn)
+    el.append(svg("line", { x1: L, x2: W - R, y1: y(a.guard_line), y2: y(a.guard_line), stroke: "var(--critical)", "stroke-width": 1.5, "stroke-dasharray": "6 4" }));
+  el.append(svg("path", { d: line, fill: "none", stroke: "var(--series)", "stroke-width": 2, "stroke-linejoin": "round" }));
+  const last = pts[pts.length - 1];
+  el.append(svg("circle", { cx: x(last[0]), cy: y(last[1]), r: 4, fill: "var(--series)", stroke: "var(--surface)", "stroke-width": 2 }));
+
+  legend.append(h("span", {}, h("i", { style: "border-color:var(--series)" }), "账户权益"),
+    h("span", {}, h("i", { style: "border-color:var(--muted);border-top-style:dashed" }), `峰值 ${num(a.peak)}`),
+    h("span", {}, h("i", { style: "border-color:var(--critical);border-top-style:dashed" }),
+      guardIn ? `guard 熔断线 ${num(a.guard_line)}` : `guard 熔断线 ${num(a.guard_line)}（在图下方，还差 ${num(a.distance)}）`));
+
+  // 十字线 + 提示
+  const cross = svg("line", { y1: T, y2: H - B, stroke: "var(--muted)", "stroke-width": 1, visibility: "hidden" });
+  const dot = svg("circle", { r: 4, fill: "var(--series)", stroke: "var(--surface)", "stroke-width": 2, visibility: "hidden" });
+  const hit = svg("rect", { x: L, y: T, width: W - L - R, height: H - T - B, fill: "transparent" });
+  el.append(cross, dot, hit);
+  const tip = $("tip");
+  const move = (ev) => {
+    const box = el.getBoundingClientRect();
+    const px = (ev.clientX - box.left) * W / box.width;
+    const tt = t0 + (px - L) / (W - L - R) * (t1 - t0);
+    let best = pts[0];
+    for (const p of pts) if (Math.abs(p[0] - tt) < Math.abs(best[0] - tt)) best = p;
+    let peak = -Infinity; for (const p of pts) { if (p[0] > best[0]) break; peak = Math.max(peak, p[1]); }
+    const cx = x(best[0]), cy = y(best[1]);
+    for (const n of [cross]) { n.setAttribute("x1", cx); n.setAttribute("x2", cx); n.setAttribute("visibility", "visible"); }
+    dot.setAttribute("cx", cx); dot.setAttribute("cy", cy); dot.setAttribute("visibility", "visible");
+    tip.replaceChildren(h("b", { class: "num" }, num(best[1])), " USDT", h("br"),
+      h("span", { class: "num" }, `回撤 ${pct(best[1] / peak - 1)}`), h("br"),
+      h("span", { class: "num", style: "color:var(--text-2)" }, fmtTime(best[0], true)));
+    tip.style.display = "block";
+    const sx = cx * box.width / W;
+    tip.style.left = `${Math.min(Math.max(sx + 10, 0), box.width - tip.offsetWidth)}px`;
+    tip.style.top = `${Math.max(0, cy * box.height / H - tip.offsetHeight - 10)}px`;
+  };
+  const leave = () => { cross.setAttribute("visibility", "hidden"); dot.setAttribute("visibility", "hidden"); tip.style.display = "none"; };
+  hit.addEventListener("pointermove", move);
+  hit.addEventListener("pointerdown", move);
+  hit.addEventListener("pointerleave", leave);
+}
+function niceStep(raw) {
+  const p = Math.pow(10, Math.floor(Math.log10(raw || 1)));
+  const f = raw / p;
+  return (f < 1.5 ? 1 : f < 3.5 ? 2 : f < 7.5 ? 5 : 10) * p;
+}
+
+function renderBots(s) {
+  const barMs = s.bar_hours * 3600000, limit = barMs + s.thresholds.bar_grace_min * 60000;
+  $("bots").replaceChildren(...s.bots.map((b) => {
+    const svc = b.service || {};
+    const running = svc.ActiveState === "active";
+    const since = svc.ActiveEnterTimestamp && svc.ActiveEnterTimestamp.startsWith("@") ? +svc.ActiveEnterTimestamp.slice(1) * 1000 : null;
+    const p = b.position, lb = b.last_bar;
+    const rows = [];
+    const row = (k, v, cls) => rows.push(h("dt", {}, k), h("dd", { class: `num ${cls || ""}` }, v));
+    row("服务", h("span", {}, badge(running ? "good" : "critical", running ? "运行中" : (svc.ActiveState || "未知")),
+      since ? ` 自 ${fmtTime(since)}` : "", svc.NRestarts && svc.NRestarts !== "0" ? ` · 重启 ${svc.NRestarts} 次` : ""));
+    if (p) {
+      row("持仓", `${p.side > 0 ? "多" : "空"} ${qtyFmt(p.qty)}`, p.side > 0 ? "pos" : "neg");
+      row("入场价", num(p.entry, p.entry < 1000 ? 3 : 2));
+      row("止损价", p.stop == null ? "无" : `${num(p.stop, p.stop < 1000 ? 3 : 2)}（${pct(p.stop / p.entry - 1)}）`);
+      row("标记价", p.mark == null ? "获取失败" : num(p.mark, p.mark < 1000 ? 3 : 2));
+      row("浮动盈亏", p.upnl == null ? "—" : `${signed(p.upnl)} USDT（${pct(p.upnl_pct)}）`, tone(p.upnl));
+      row("开仓时间", fmtTime(p.opened_at));
+    } else {
+      row("持仓", "无");
+    }
+    if (b.unresolved) row("待核对订单", String(b.unresolved.id || "?"), "neg");
+    if (lb) {
+      const sig = lb.signal == null ? "—" : lb.signal > 0 ? "+1 看多" : lb.signal < 0 ? "−1 看空" : "0 空仓";
+      row("最近 K 线信号", sig);
+      row("K 线收盘", h("span", {}, `${fmtTime(lb.close_ts)} `, h("span", { style: "color:var(--muted)" }, `(${fmtUtc(lb.close_ts)})`)));
+      if (lb.close != null) row("收盘价", num(lb.close, lb.close < 1000 ? 3 : 2));
+      row("距收盘", `${ago(lb.close_ts)} / 警戒 ${(limit / 3600000).toFixed(1)} 小时`, b.bar_overdue ? "neg" : "");
+      row("本币权益（账本）", num(lb.equity));
+    } else {
+      row("最近 K 线", "账本里还没有记录");
+    }
+    const logs = [...b.errors.map((e) => ({ ...e, kind: "ERROR" })), ...b.warnings.map((w) => ({ ...w, kind: "对账" }))]
+      .sort((x, y) => y.ts - x.ts);
+    const det = h("details", {}, h("summary", {}, `最近 ERROR ${b.errors.length} 条 · 对账警告 ${b.warnings.length} 条（24 小时内 ${b.errors_24h} / ${b.warnings_24h}）`),
+      logs.length ? h("ul", { class: "loglist" }, logs.map((l) => h("li", {}, h("span", { class: "t num" }, `${fmtTime(l.ts)} ${l.kind}`), l.text,
+        l.detail ? h("span", { class: "d" }, l.detail) : null))) : h("p", { class: "empty" }, "无"));
+    return h("div", { class: "card" }, h("div", { class: "bot-head" }, h("h2", {}, b.name, " ", h("span", { class: "meta" }, b.symbol)),
+      b.bar_overdue ? badge("serious", "K 线超时") : null), h("dl", { class: "kv" }, rows), det);
+  }));
+}
+
+function renderFills(fills) {
+  const tb = $("fills");
+  if (!fills.length) { tb.replaceChildren(h("tr", {}, h("td", { colspan: 8, class: "empty" }, "还没有成交"))); return; }
+  const REASON = { signal: "信号", stop_loss: "止损", take_profit: "止盈", liquidation: "强平", circuit_breaker: "熔断", reconcile: "对账" };
+  tb.replaceChildren(...fills.map((f) => h("tr", {},
+    h("td", { class: "num" }, fmtTime(f.ts, true)), h("td", {}, f.symbol),
+    h("td", { class: f.side === "buy" ? "pos" : "neg" }, f.side === "buy" ? "买" : "卖"),
+    h("td", { class: "num" }, qtyFmt(f.qty)), h("td", { class: "num" }, num(f.price, f.price < 1000 ? 3 : 2)),
+    h("td", { class: "num" }, num(f.fee, 4)), h("td", { class: `num ${tone(f.pnl)}` }, f.pnl == null ? "—" : signed(f.pnl, 3)),
+    h("td", {}, REASON[f.reason] ? `${REASON[f.reason]} (${f.reason})` : f.reason))));
+}
+
+function renderGuard(s) {
+  const g = s.guard, a = s.account;
+  const ok = g.result === "success";
+  const rows = [];
+  const row = (k, v) => rows.push(h("dt", {}, k), h("dd", { class: "num" }, v));
+  row("定时器", badge(g.timer_active === "active" ? "good" : "critical", g.timer_active === "active" ? "运行中" : (g.timer_active || "未知")));
+  row("上次运行", h("span", {}, badge(ok ? "good" : "serious", ok ? "成功" : (g.result || "未知")),
+    ` 退出码 ${g.exit_status ?? "—"} · ${fmtTime(g.last_exit)}（${ago(g.last_exit)}）`));
+  row("最后一条权益记录", `${fmtTime(g.last_line)}（${ago(g.last_line)}）`);
+  row("停机状态", a ? (a.halted ? badge("critical", `已停机：${a.halt_reason || ""}`) : badge("good", "未停机")) : "—");
+  $("guard").replaceChildren(...rows);
+  $("guard-events").replaceChildren(...(g.events.length ? g.events.map((e) => h("li", {}, h("span", { class: "t num" }, fmtTime(e.ts)), e.text))
+    : [h("li", { class: "empty" }, "无")]));
+}
+
+$("refresh").addEventListener("click", load);
+let resizeT; addEventListener("resize", () => { clearTimeout(resizeT); resizeT = setTimeout(() => snap && renderChart(snap), 150); });
+setInterval(load, REFRESH_MS);
+setInterval(() => { if (snap) { $("age").textContent = ago(snap.generated_at); } }, 10000);
+load();
+</script>
+</body>
+</html>

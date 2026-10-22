@@ -37,6 +37,8 @@ Copy-Item config.example.yaml config.yaml
 .venv/bin/python main.py testnet --market perp
 ```
 
+服务器上的实时情况可以用只读看板查看：`ssh -N -L 8765:127.0.0.1:8765 admin@<服务器IP>`，然后打开 http://127.0.0.1:8765 。安装和使用说明见 `DEPLOY.md` 第 11 节。
+
 常用参数：`--exchange`（任意 ccxt 交易所 ID，默认 binance）、`--symbol`、`--timeframe`、`--strategy`、`--config`。
 
 ## 工作流程
@@ -104,7 +106,7 @@ walk-forward 和事后最优差距越大，说明“回测里挑出来的好参�
 | `bot/trader.py` | 回测和实时运行共用的决策核心 |
 | `bot/engine/` | `backtest.py` 回测，`optimize.py` 网格搜索与 walk-forward，`live.py` 模拟盘 / 测试网轮询 |
 | `bot/metrics.py`, `bot/report.py` | 绩效指标与报告 |
-| `tools/` | 前向验证与组合层：`forward_bot.ps1` 看护进程（多品种）、`forward_status.py` 状态、`forward_report.py` 阶段报告、`portfolio_guard.py` 组合回撤闸门、`portfolio_backtest.py` 等权组合回测 |
+| `tools/` | 前向验证与组合层：`forward_bot.ps1` 看护进程（多品种）、`forward_status.py` 状态、`forward_report.py` 阶段报告、`portfolio_guard.py` 组合回撤闸门、`portfolio_backtest.py` 等权组合回测、`dashboard.py` + `dashboard.html` 只读看板（SSH 隧道访问，见 `DEPLOY.md` 第 11 节） |
 | `Dockerfile`, `docker-compose.yml`, `deploy/` | 常驻部署（两个品种 + 组合闸门），步骤见 `DEPLOY.md` |
 | `tests/` | `pytest` 单元测试 |
 
