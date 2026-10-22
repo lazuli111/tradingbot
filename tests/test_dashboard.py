@@ -99,6 +99,7 @@ class Env:
             "tradingbot-guard.timer": {"ActiveState": "active", "LastTriggerUSec": "Thu 2026-10-22 04:15:00 UTC"},
         }
         self.mark_price = 105.0
+        self.cgroup_states = {"tradingbot-btc.service": "active", "tradingbot-sol.service": "active"}
         self.cfg = dash.Config(root=self.root, guard_log=self.logs / "guard.log", log_tz=timezone.utc, bots={
             "BTC": ("tradingbot-btc.service", self.logs / "btc.log"),
             "SOL": ("tradingbot-sol.service", self.logs / "sol.log"),
@@ -115,8 +116,11 @@ class Env:
             raise TimeoutError("no network")
         return self.mark_price
 
-    def snapshot(self, now=NOW):
-        return dash.build_snapshot(self.cfg, now, show=self.show, mark=self.mark)
+    def snapshot(self, now=NOW, show=None):
+        return dash.build_snapshot(self.cfg, now, show=show or self.show, mark=self.mark, cgroup=self.cgroup)
+
+    def cgroup(self, unit):
+        return {"ActiveState": self.cgroup_states.get(unit, "inactive"), "source": "cgroup"}
 
 
 @pytest.fixture
@@ -240,6 +244,56 @@ def test_near_guard_line_warning(env):
     assert any("不到 5 个百分点" in t for _, t in levels(env.snapshot()))
 
 
+def test_systemd_unreadable_falls_back_to_cgroup(env):
+    """看板的 systemd 沙箱里 systemctl 读不到状态：服务看 cgroup，guard 看日志，不误报“未运行”。"""
+    def broken(unit, props):
+        raise RuntimeError("systemctl show 退出码 1: Failed to connect to bus")
+
+    env.cgroup_states["tradingbot-sol.service"] = "inactive"
+    snap = env.snapshot(show=broken)
+    btc, sol = snap["bots"]
+    assert btc["service"]["ActiveState"] == "active" and btc["service"]["source"] == "cgroup"
+    assert "Failed to connect to bus" in btc["service"]["error"]
+    found = levels(snap)
+    assert ("critical", "SOL 服务未运行（inactive）") in found
+    assert not any("BTC 服务未运行" in t or "定时器" in t or "上次运行失败" in t for _, t in found)
+    assert any(lvl == "info" and "读不到 systemd 状态" in t and "Failed to connect to bus" in t for lvl, t in found)
+    assert "Failed to connect to bus" in snap["guard"]["systemd_error"]
+    # guard 停了照样能发现：日志过期
+    assert any("guard 已 25 分钟没有新记录" in t for _, t in levels(env.snapshot(NOW + 20 * 60_000, show=broken)))
+
+
+def test_systemctl_show_raises_on_failure(monkeypatch):
+    class R:
+        returncode, stdout, stderr = 1, "", "Failed to connect to bus: Permission denied"
+    monkeypatch.setattr(dash.subprocess, "run", lambda *a, **k: R)
+    with pytest.raises(RuntimeError, match="Permission denied"):
+        dash.systemctl_show("x.service", ["ActiveState"])
+    R.returncode, R.stdout = 0, "ActiveState=active\n"
+    assert dash.systemctl_show("x.service", ["ActiveState"]) == {"ActiveState": "active"}
+
+
+def test_cgroup_state(tmp_path):
+    root, proc = tmp_path / "cg", tmp_path / "proc"
+    (root / "a.service").mkdir(parents=True)
+    (root / "a.service" / "cgroup.events").write_text("populated 1\nfrozen 0\n")
+    (root / "a.service" / "cgroup.procs").write_text("4400\n4401\n")
+    (root / "b.service").mkdir()
+    (root / "b.service" / "cgroup.events").write_text("populated 0\nfrozen 0\n")
+    (root / "b.service" / "cgroup.procs").write_text("")
+    (proc / "4400").mkdir(parents=True)
+    (proc / "4401").mkdir()
+    (proc / "stat").write_text("cpu 1 2 3\nbtime 1792640000\n")
+    ticks = os.sysconf("SC_CLK_TCK")
+    fields = lambda start: " ".join(["S"] + ["0"] * 18 + [str(start)] + ["0"] * 10)
+    (proc / "4400" / "stat").write_text(f"4400 (python (x)) {fields(500 * ticks)}")
+    (proc / "4401" / "stat").write_text(f"4401 (python) {fields(900 * ticks)}")
+    assert dash.cgroup_state("a.service", root, proc) == {
+        "ActiveState": "active", "SubState": "running", "source": "cgroup", "ActiveEnterTimestamp": "@1792640500"}
+    assert dash.cgroup_state("b.service", root, proc)["ActiveState"] == "inactive"
+    assert dash.cgroup_state("missing.service", root, proc)["ActiveState"] == "inactive"
+
+
 def test_mark_price_failure_is_soft(env):
     env.mark_price = None
     snap = env.snapshot()
@@ -351,8 +405,7 @@ def server(env):
 
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), None)
     port = httpd.server_port
-    httpd.RequestHandlerClass = dash.make_handler(dash.Snapshots(env.cfg, 30, build),
-                                                  dash.HTML_PATH.read_bytes(), port)
+    httpd.RequestHandlerClass = dash.make_handler(dash.Snapshots(env.cfg, 30, build), dash.HTML_PATH.read_bytes())
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
     t.start()
     yield port, calls
@@ -395,6 +448,8 @@ def test_http_rejects_writes_foreign_hosts_and_unknown_paths(server):
     assert request(port, "/", host="evil.example:8765")[0] == 403  # DNS rebinding
     assert request(port, "/api/snapshot", host=f"attacker.test:{port}")[0] == 403
     assert request(port, "/", host=f"localhost:{port}")[0] == 200
+    assert request(port, "/", host="127.0.0.1:18080")[0] == 200  # 隧道换了本地端口也能用
+    assert request(port, "/", host="localhost.evil.example")[0] == 403
     assert request(port, "/.env")[0] == 404
     assert request(port, "/../.env")[0] == 404
 

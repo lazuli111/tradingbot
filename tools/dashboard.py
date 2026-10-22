@@ -13,6 +13,7 @@ import argparse
 import gzip
 import ipaddress
 import json
+import os
 import re
 import sqlite3
 import subprocess
@@ -29,6 +30,7 @@ from urllib.parse import quote
 HOUR_MS = 3_600_000
 MARK_URL = "https://demo-fapi.binance.com/fapi/v1/premiumIndex?symbol={}"
 HTML_PATH = Path(__file__).with_name("dashboard.html")
+CGROUP_ROOT = Path("/sys/fs/cgroup/system.slice")
 
 # 对账 / 下单异常相关的 WARNING（其余 WARNING 如 set_margin_mode 失败是每次启动都有的噪音）
 RECONCILE_WORDS = ("不一致", "状态未知", "核对", "补设止损", "未成交", "盈亏未知", "重新处理", "熔断", "被拒")
@@ -167,10 +169,36 @@ def parse_bot_log(lines: list[str], tz: tzinfo | None) -> dict:
 
 
 def systemctl_show(unit: str, props: list[str]) -> dict:
-    out = subprocess.run(
+    r = subprocess.run(
         ["systemctl", "show", unit, "--timestamp=unix", "-p", ",".join(props)],
-        capture_output=True, text=True, timeout=5).stdout
-    return dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+        capture_output=True, text=True, timeout=5)
+    values = dict(line.split("=", 1) for line in r.stdout.splitlines() if "=" in line)
+    if r.returncode != 0 or not values:
+        raise RuntimeError(f"systemctl show 退出码 {r.returncode}: {(r.stderr or r.stdout).strip()[:200]}")
+    return values
+
+
+def cgroup_state(unit: str, root: Path = CGROUP_ROOT, proc: Path = Path("/proc")) -> dict:
+    """不经 D-Bus 判断服务是否在跑：unit 的 cgroup 里有进程就是在跑，启动时间取其中最早的进程。
+    systemctl 在看板的 systemd 沙箱里读不到状态时用它兜底（cgroup 和 /proc 对任何用户都可读）。"""
+    d = root / unit
+    try:
+        events = dict(line.split() for line in (d / "cgroup.events").read_text().splitlines() if " " in line)
+        pids = [int(p) for p in (d / "cgroup.procs").read_text().split()]
+    except OSError:
+        return {"ActiveState": "inactive", "source": "cgroup"}
+    if events.get("populated") != "1" or not pids:
+        return {"ActiveState": "inactive", "source": "cgroup"}
+    state = {"ActiveState": "active", "SubState": "running", "source": "cgroup"}
+    try:
+        btime = next(int(line.split()[1]) for line in (proc / "stat").read_text().splitlines()
+                     if line.startswith("btime "))
+        ticks = os.sysconf("SC_CLK_TCK")
+        starts = [int((proc / str(p) / "stat").read_text().rsplit(")", 1)[1].split()[19]) for p in pids]
+        state["ActiveEnterTimestamp"] = f"@{btime + min(starts) // ticks}"
+    except (OSError, StopIteration, ValueError, IndexError):
+        pass
+    return state
 
 
 def _unix_ms(value: str | None) -> int | None:
@@ -221,7 +249,8 @@ def downsample(points: list[list], max_points: int) -> list[list]:
     return out
 
 
-def build_snapshot(cfg: Config, now_ms: int | None = None, show=systemctl_show, mark=fetch_mark) -> dict:
+def build_snapshot(cfg: Config, now_ms: int | None = None, show=systemctl_show, mark=fetch_mark,
+                   cgroup=cgroup_state) -> dict:
     now_ms = now_ms or int(time.time() * 1000)
     bar_ms = int(cfg.bar_hours * HOUR_MS)
     alerts: list[dict] = []
@@ -239,6 +268,7 @@ def build_snapshot(cfg: Config, now_ms: int | None = None, show=systemctl_show, 
 
     # 机器人
     bots = []
+    systemd_errors: list[str] = []
     positions_open = 0
     for name, (unit, log_path) in cfg.bots.items():
         run = run_by_base.get(name)
@@ -248,6 +278,9 @@ def build_snapshot(cfg: Config, now_ms: int | None = None, show=systemctl_show, 
         broker = trader.get("broker", {})
         pos = broker.get("position")
         svc = _service(show, unit, ["ActiveState", "SubState", "ActiveEnterTimestamp", "NRestarts"])
+        if "error" in svc:
+            systemd_errors.append(svc["error"])
+            svc = {**cgroup(unit), "error": svc["error"]}
         log = parse_bot_log(tail_lines(log_path, cfg.log_tail_bytes), cfg.log_tz)
 
         position = None
@@ -338,23 +371,30 @@ def build_snapshot(cfg: Config, now_ms: int | None = None, show=systemctl_show, 
     else:
         alert("serious", "guard 日志里没有权益记录")
 
+    # 读不到 systemd 时 guard 的死活只看日志新不新（上面“没有新记录”的告警）
     gsvc = _service(show, cfg.guard_service, ["Result", "ExecMainStatus", "ExecMainExitTimestamp"])
     gtimer = _service(show, cfg.guard_timer, ["ActiveState", "LastTriggerUSec"])
+    systemd_errors += [x["error"] for x in (gsvc, gtimer) if "error" in x]
     guard = {
         "result": gsvc.get("Result"), "exit_status": gsvc.get("ExecMainStatus"),
         "last_exit": _unix_ms(gsvc.get("ExecMainExitTimestamp")),
         "timer_active": gtimer.get("ActiveState"), "last_trigger": _unix_ms(gtimer.get("LastTriggerUSec")),
         "last_line": pts[-1]["ts"] if pts else None,
         "events": guard_log["events"][-10:][::-1],
+        "systemd_error": gtimer.get("error") or gsvc.get("error"),
     }
-    if gtimer.get("ActiveState") != "active":
+    if "error" not in gtimer and gtimer.get("ActiveState") != "active":
         alert("critical", f"guard 定时器未运行（{gtimer.get('ActiveState') or '未知'}）")
-    if gsvc.get("Result") not in (None, "success"):
+    if "error" not in gsvc and gsvc.get("Result") != "success":
         alert("serious", f"guard 上次运行失败：{gsvc.get('Result')}，退出码 {gsvc.get('ExecMainStatus')}")
 
     names = {r: run_symbol(r).split("/")[0] for r in db["runs"]}
     fills = [{**{k: f[k] for k in ("ts", "side", "qty", "price", "fee", "pnl", "reason")},
               "symbol": names.get(f["run"], f["run"])} for f in sorted(db["fills"], key=lambda f: (f["ts"], f["id"]))[-500:][::-1]]
+
+    if systemd_errors:
+        alert("info", f"读不到 systemd 状态，服务是否在跑改看 cgroup，guard 看日志：{systemd_errors[0]}")
+        _log_once(systemd_errors[0])
 
     order = {"critical": 0, "serious": 1, "warning": 2, "info": 3}
     alerts.sort(key=lambda a: order[a["level"]])
@@ -370,8 +410,18 @@ def build_snapshot(cfg: Config, now_ms: int | None = None, show=systemctl_show, 
 def _service(show, unit: str, props: list[str]) -> dict:
     try:
         return show(unit, props)
-    except (OSError, subprocess.SubprocessError):
-        return {}
+    except Exception as e:  # noqa: BLE001 - 读不到就降级，不能让整个快照失败
+        return {"error": f"{type(e).__name__}: {e}"[:300]}
+
+
+_last_logged: list[str] = [""]
+
+
+def _log_once(message: str) -> None:
+    """同一条错误只往 journal 打一次，免得每 30 秒刷屏。"""
+    if message != _last_logged[0]:
+        _last_logged[0] = message
+        print(f"systemd 状态读取失败: {message}", file=sys.stderr, flush=True)
 
 
 # ---- HTTP（只读：只有 GET） ------------------------------------------------
@@ -403,8 +453,8 @@ SECURITY_HEADERS = {
 }
 
 
-def make_handler(snapshots: Snapshots, html: bytes, port: int):
-    allowed_hosts = {f"{h}:{port}" for h in ("127.0.0.1", "localhost", "[::1]")}
+def make_handler(snapshots: Snapshots, html: bytes):
+    allowed_hosts = {"127.0.0.1", "localhost", "[::1]"}
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "tradingbot-dashboard"
@@ -412,7 +462,9 @@ def make_handler(snapshots: Snapshots, html: bytes, port: int):
 
         def do_GET(self) -> None:  # noqa: N802
             # 只认 localhost 的 Host 头：防止 DNS rebinding 让别的网站借浏览器读数据
-            if self.headers.get("Host") not in allowed_hosts:
+            # 端口不限：隧道本地端口可以随便选（如 ssh -L 18080:127.0.0.1:8765）
+            host = re.sub(r":\d+$", "", self.headers.get("Host") or "")
+            if host not in allowed_hosts:
                 return self._send(403, b"forbidden", "text/plain; charset=utf-8")
             path = self.path.split("?", 1)[0]
             if path == "/":
@@ -449,7 +501,7 @@ def make_handler(snapshots: Snapshots, html: bytes, port: int):
 def serve(cfg: Config, host: str, port: int, ttl: float) -> None:
     if not ipaddress.ip_address(host).is_loopback:
         raise SystemExit(f"只允许监听回环地址（127.0.0.1 / ::1），拒绝 {host}；远程访问请用 ssh -L 隧道")
-    handler = make_handler(Snapshots(cfg, ttl), HTML_PATH.read_bytes(), port)
+    handler = make_handler(Snapshots(cfg, ttl), HTML_PATH.read_bytes())
     server = ThreadingHTTPServer((host, port), handler)
     print(f"看板已启动: http://{host}:{port}  （快照缓存 {ttl:.0f} 秒）", flush=True)
     try:
