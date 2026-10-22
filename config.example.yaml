@@ -13,7 +13,7 @@ fees:
   perp: 0.0005           # 合约 taker 手续费
 
 strategy:
-  name: ma_cross         # ma_cross | donchian（另有 rsi2 | bb_reversion | bb_breakout | dual_thrust | vol_system，仅供研究，见 docs/research/oss_strategies.md）
+  name: ma_cross         # ma_cross | donchian
   params:
     fast: 20
     slow: 50
