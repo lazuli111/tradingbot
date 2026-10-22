@@ -153,9 +153,9 @@ docker compose exec guard python tools/portfolio_guard.py --status   # 账户权
 - 只监听 `127.0.0.1:8765`，不开任何新端口，代码也拒绝绑定非回环地址；只能通过 SSH 隧道访问。
 - 只读：只有 GET，页面上没有下单、平仓、启停按钮；账本用 SQLite `mode=ro` 打开，不写、不锁机器人的 `portfolio.db`。
 - systemd 用 `DynamicUser=yes` 的临时用户运行，整个文件系统只读，`.env` / `.git` 不可见；不需要也读不到 API Key。浮动盈亏用 Binance Demo 的公开标记价接口计算。
-- 只认 `localhost` / `127.0.0.1` 的 Host 头（防 DNS rebinding），带 CSP、`X-Frame-Options: DENY`，页面不加载任何外部资源。
+- 只认 `localhost` / `127.0.0.1` 的 Host 头（防 DNS rebinding；本地端口不限，隧道可以用别的本地端口），带 CSP、`X-Frame-Options: DENY`，页面不加载任何外部资源。
 
-**数据来源**：账本 `data/portfolio.db`（持仓、止损、K 线、成交）、`data/portfolio_guard.json`（峰值、停机状态）、`/var/log/tradingbot-guard.log`（账户总权益，每 5 分钟一行）、`/var/log/tradingbot-{btc,sol}.log`（ERROR、对账警告、最后一次 K 线处理）、`systemctl show`（服务和 guard 定时器状态）。
+**数据来源**：账本 `data/portfolio.db`（持仓、止损、K 线、成交）、`data/portfolio_guard.json`（峰值、停机状态）、`/var/log/tradingbot-guard.log`（账户总权益，每 5 分钟一行）、`/var/log/tradingbot-{btc,sol}.log`（ERROR、对账警告、最后一次 K 线处理）、`systemctl show`（服务和 guard 定时器状态；在沙箱里读不到时，服务是否在跑改看 `/sys/fs/cgroup` 里该服务有没有进程，guard 只看日志是否按时更新，告警区会有一条“读不到 systemd 状态”的提示，原因写进 `journalctl -u tradingbot-dashboard`）。
 
 **流量**：首次打开约 9 KB（gzip），之后每分钟拉一次约 3 KB 的快照；页面一直开着一天约 4 MB。服务端快照缓存 30 秒，多开几个页面也只采集一次。
 

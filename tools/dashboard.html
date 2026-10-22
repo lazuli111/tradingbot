@@ -333,7 +333,8 @@ function renderBots(s) {
     const rows = [];
     const row = (k, v, cls) => rows.push(h("dt", {}, k), h("dd", { class: `num ${cls || ""}` }, v));
     row("服务", h("span", {}, badge(running ? "good" : "critical", running ? "运行中" : (svc.ActiveState || "未知")),
-      since ? ` 自 ${fmtTime(since)}` : "", svc.NRestarts && svc.NRestarts !== "0" ? ` · 重启 ${svc.NRestarts} 次` : ""));
+      since ? ` 自 ${fmtTime(since)}` : "", svc.NRestarts && svc.NRestarts !== "0" ? ` · 重启 ${svc.NRestarts} 次` : "",
+      svc.source === "cgroup" ? h("span", { style: "color:var(--muted)" }, "（按进程判断）") : null));
     if (p) {
       row("持仓", `${p.side > 0 ? "多" : "空"} ${qtyFmt(p.qty)}`, p.side > 0 ? "pos" : "neg");
       row("入场价", num(p.entry, p.entry < 1000 ? 3 : 2));
@@ -382,9 +383,13 @@ function renderGuard(s) {
   const ok = g.result === "success";
   const rows = [];
   const row = (k, v) => rows.push(h("dt", {}, k), h("dd", { class: "num" }, v));
-  row("定时器", badge(g.timer_active === "active" ? "good" : "critical", g.timer_active === "active" ? "运行中" : (g.timer_active || "未知")));
-  row("上次运行", h("span", {}, badge(ok ? "good" : "serious", ok ? "成功" : (g.result || "未知")),
-    ` 退出码 ${g.exit_status ?? "—"} · ${fmtTime(g.last_exit)}（${ago(g.last_exit)}）`));
+  if (g.systemd_error) {
+    row("定时器 / 上次运行", badge("info", "读不到 systemd，按下面的权益记录时间判断"));
+  } else {
+    row("定时器", badge(g.timer_active === "active" ? "good" : "critical", g.timer_active === "active" ? "运行中" : (g.timer_active || "未知")));
+    row("上次运行", h("span", {}, badge(ok ? "good" : "serious", ok ? "成功" : (g.result || "未知")),
+      ` 退出码 ${g.exit_status ?? "—"} · ${fmtTime(g.last_exit)}（${ago(g.last_exit)}）`));
+  }
   row("最后一条权益记录", `${fmtTime(g.last_line)}（${ago(g.last_line)}）`);
   row("停机状态", a ? (a.halted ? badge("critical", `已停机：${a.halt_reason || ""}`) : badge("good", "未停机")) : "—");
   $("guard").replaceChildren(...rows);
