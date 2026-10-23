@@ -209,13 +209,14 @@ class CcxtBroker(Broker):
         return order
 
     def _make_fill(self, side: str, filled: float, avg: float, fee_info: dict, ts: int,
-                   reason: str) -> Fill:
+                   reason: str, ref_price: float | None, order_id) -> Fill:
         fee = self._fee_in_quote(fee_info, avg)
         if not self.is_perp and side == "buy" and fee_info.get("currency") == self.market["base"]:
             filled -= float(fee_info.get("cost") or 0)  # fee was taken out of the coins we bought
         self.stats.fees += fee
         log.info("订单成交 %s %s %.6f @ %.2f (%s)", side, self.symbol, filled, avg, reason)
-        return Fill(ts, side, filled, avg, fee, reason)
+        return Fill(ts, side, filled, avg, fee, reason, ref_price=ref_price,
+                    order_id=None if order_id is None else str(order_id))
 
     def _fill_from_order(self, order: dict, side: str, amount: float, price: float, ts: int,
                          reason: str) -> Fill | None:
@@ -226,7 +227,9 @@ class CcxtBroker(Broker):
             return None
         avg = float(order.get("average") or price)
         fee_info = order.get("fee") or self._fee_from_trades(self._order_trades(order.get("id")))
-        return self._make_fill(side, filled, avg, fee_info, ts, reason)
+        # no average price: avg is our own request price, so there's no slippage to measure
+        return self._make_fill(side, filled, avg, fee_info, ts, reason,
+                               price if order.get("average") else None, order.get("id"))
 
     def _resolve(self, order_id, side: str, amount: float, price: float, ts: int, reason: str,
                  before: float) -> Fill | None:
@@ -265,7 +268,8 @@ class CcxtBroker(Broker):
         log.warning("订单 %s 查询失败，按交易所%s判断为已成交 %.6f @ %.2f%s", order_id,
                     "持仓" if self.is_perp else "成交记录", filled, avg, "（成交价为估算）" if estimated else "")
         return self._make_fill(side, filled, avg, self._fee_from_trades(trades), ts,
-                               f"{reason}（成交价估算/已与交易所核对）" if estimated else reason)
+                               f"{reason}（成交价估算/已与交易所核对）" if estimated else reason,
+                               None if estimated else price, order_id)
 
     def _send(self, side: str, qty: float, price: float, ts: int, reason: str,
               reduce_only: bool = False, position_side: str | None = None) -> Fill | None:
