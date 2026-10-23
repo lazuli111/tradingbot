@@ -20,6 +20,8 @@ CREATE TABLE IF NOT EXISTS state (
     run TEXT PRIMARY KEY, data TEXT NOT NULL
 );
 """
+# fills columns added after the first ledgers were written; added in place on open
+FILL_EXTRAS = {"ref_price": "REAL", "trigger_price": "REAL", "order_id": "TEXT"}
 
 
 class Storage:
@@ -31,12 +33,27 @@ class Storage:
         # 多品种并行时会有多个进程写同一个账本，WAL 下读写不互相阻塞
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        self._add_fill_columns()
         self.run = run
+
+    def _add_fill_columns(self) -> None:
+        have = {row[1] for row in self.conn.execute("PRAGMA table_info(fills)")}
+        for name, type_ in FILL_EXTRAS.items():
+            if name in have:
+                continue
+            try:
+                self.conn.execute(f"ALTER TABLE fills ADD COLUMN {name} {type_}")
+            except sqlite3.OperationalError as e:  # the other bot process got there first
+                if "duplicate column" not in str(e):
+                    raise
+        self.conn.commit()
 
     def record_fill(self, fill: Fill) -> None:
         self.conn.execute(
-            "INSERT INTO fills (run, ts, side, qty, price, fee, pnl, reason) VALUES (?,?,?,?,?,?,?,?)",
-            (self.run, fill.ts, fill.side, fill.qty, fill.price, fill.fee, fill.pnl, fill.reason))
+            "INSERT INTO fills (run, ts, side, qty, price, fee, pnl, reason, ref_price, trigger_price, order_id)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (self.run, fill.ts, fill.side, fill.qty, fill.price, fill.fee, fill.pnl, fill.reason,
+             fill.ref_price, fill.trigger_price, fill.order_id))
         self.conn.commit()
 
     def record_equity(self, ts: int, equity: float) -> None:

@@ -28,6 +28,10 @@ class Fill:
     fee: float
     reason: str
     pnl: float | None = None  # net realized PnL of the round trip, on closing fills
+    # slippage bookkeeping: what the bot asked for vs what it got
+    ref_price: float | None = None      # price at decision time; None if the fill price is a guess
+    trigger_price: float | None = None  # stop / take-profit level, on the exit it triggered
+    order_id: str | None = None
 
 
 @dataclass

@@ -71,9 +71,9 @@ class Trader:
         if liquidated:
             self._emit(self.broker.liquidate(ts))
         elif stop_hit:
-            self._emit(self.broker.close(stop_px, ts, "stop_loss"))
+            self._emit(self._triggered(self.broker.close(stop_px, ts, "stop_loss"), stop))
         elif tp_hit:
-            self._emit(self.broker.close(tp_px, ts, "take_profit"))
+            self._emit(self._triggered(self.broker.close(tp_px, ts, "take_profit"), tp))
 
     def on_bar_close(self, ts: int, close: float, signal: int, atr: float) -> float:
         self.last_atr = atr
@@ -135,6 +135,13 @@ class Trader:
         if cfg.take_profit_atr_mult:
             pos.take_profit = pos.entry + pos.side * atr * cfg.take_profit_atr_mult
         log.warning("持仓没有止损（从交易所同步而来），按 ATR 补设止损 %.2f", pos.stop)
+
+    @staticmethod
+    def _triggered(fill: Fill | None, level: float) -> Fill | None:
+        """Note the stop / take-profit level on the exit, to measure slippage against it."""
+        if fill is not None:
+            fill.trigger_price = level
+        return fill
 
     def _emit(self, fill: Fill | None) -> None:
         if fill is not None and self.on_fill:

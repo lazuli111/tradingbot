@@ -59,7 +59,7 @@ class SimBroker(Broker):
         self.position = Position(
             side=side, qty=qty, entry=fill_price, opened_at=ts, entry_fee=fee, margin=margin,
             liq_price=self.liquidation_price(side, fill_price) if self.is_perp else None)
-        return Fill(ts, "buy" if side == 1 else "sell", qty, fill_price, fee, reason)
+        return Fill(ts, "buy" if side == 1 else "sell", qty, fill_price, fee, reason, ref_price=price)
 
     def close(self, price: float, ts: int, reason: str) -> Fill | None:
         pos = self.position
@@ -73,7 +73,8 @@ class SimBroker(Broker):
         net = gross - fee - pos.entry_fee + pos.funding
         self._record_close(pos, fill_price, ts, fee, net, reason)
         self.position = None
-        return Fill(ts, "sell" if pos.side == 1 else "buy", pos.qty, fill_price, fee, reason, net)
+        return Fill(ts, "sell" if pos.side == 1 else "buy", pos.qty, fill_price, fee, reason, net,
+                    ref_price=price)
 
     def liquidate(self, ts: int) -> Fill | None:
         pos = self.position
