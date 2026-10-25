@@ -1,7 +1,10 @@
 """前向验证的阶段报告：把 SQLite 账本里的权益曲线和同期买入持有放在一起比。
 
     python tools/forward_report.py
-    python tools/forward_report.py --db data/forward.db --symbol BTC/USDT:USDT --timeframe 4h --out reports/forward
+    python tools/forward_report.py --run testnet:binance:perp:SOL/USDT:USDT:4h:ma_cross --out reports/forward
+
+同期行情（买入持有、K 线开盘价）的交易所、品种、周期默认从 run 名里取，
+--exchange / --symbol / --timeframe 只在要覆盖时才传。
 
 判读标准（事先定好，别事后找理由）：见 HANDOVER「前向验证」一节。
 滑点：每笔成交记着决策价（止损 / 止盈另记触发价），报告给出 bp 统计并对照验收线；
@@ -31,6 +34,32 @@ MAX_MEAN_SLIPPAGE_BPS = 5.0
 MAX_SINGLE_SLIPPAGE_BPS = 20.0
 MAX_MEAN_STOP_SLIPPAGE_BPS = 10.0
 MARKET_REASONS = ("signal", "circuit_breaker")
+
+
+def parse_run(run: str) -> dict:
+    """拆开 bot/engine/live.py 拼的 run 名：模式:交易所:市场:品种:周期:策略。
+
+    永续的品种自带冒号（BTC/USDT:USDT），现货没有，所以品种取第 4 段到倒数第 3 段。
+    """
+    parts = run.split(":")
+    if len(parts) < 6 or not all(parts):
+        raise ValueError(f"认不出 run 名 {run!r}")
+    return {"exchange": parts[1], "market": parts[2], "symbol": ":".join(parts[3:-2]), "timeframe": parts[-2]}
+
+
+def market_of(run: str, exchange: str | None = None, symbol: str | None = None,
+              timeframe: str | None = None) -> dict:
+    """同期行情用哪个交易所 / 品种 / 周期：命令行传了的优先，没传的从 run 名里取。"""
+    given = {"exchange": exchange, "symbol": symbol, "timeframe": timeframe}
+    try:
+        parsed = parse_run(run)
+    except ValueError:
+        missing = [k for k, v in given.items() if v is None]
+        if missing:
+            raise ValueError(f"认不出 run 名 {run!r}，请用 " + " / ".join(f"--{k}" for k in missing) + " 指定")
+        # 市场看品种：永续的品种自带结算币（BTC/USDT:USDT）
+        parsed = {"market": "perp" if ":" in symbol else "spot"}
+    return {**parsed, **{k: v for k, v in given.items() if v is not None}}
 
 
 def load_ledger(db: str, run: str):
@@ -92,15 +121,20 @@ def slippage_report(fills: list[dict], bar_open: dict[int, float], step: int) ->
     return lines
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="前向验证报告")
     ap.add_argument("--db", default=DEFAULT_DB)
     ap.add_argument("--run", default=DEFAULT_RUN)
-    ap.add_argument("--exchange", default="binance")
-    ap.add_argument("--symbol", default="BTC/USDT:USDT")
-    ap.add_argument("--timeframe", default="4h")
+    ap.add_argument("--exchange", default=None, help="默认取 run 名里的交易所")
+    ap.add_argument("--symbol", default=None, help="默认取 run 名里的品种，例如 SOL/USDT:USDT")
+    ap.add_argument("--timeframe", default=None, help="默认取 run 名里的周期")
     ap.add_argument("--out", default=None, help="把权益曲线与成交写成 CSV 的目录")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
+    try:
+        mkt = market_of(args.run, args.exchange, args.symbol, args.timeframe)
+    except ValueError as e:
+        print(e)
+        return 1
 
     if not Path(args.db).exists():
         print(f"没有找到 {args.db}")
@@ -119,16 +153,18 @@ def main() -> int:
         print("⚠ 出现过强平")
 
     # 同期买入持有：从公开行情取同一区间，按权益点对齐
-    ex = make_exchange(args.exchange, "perp")
-    bars = fetch_ohlcv_range(ex, args.symbol, args.timeframe, first_ts, last_ts + timeframe_ms(args.timeframe))
+    step = timeframe_ms(mkt["timeframe"])
+    ex = make_exchange(mkt["exchange"], mkt["market"])
+    bars = fetch_ohlcv_range(ex, mkt["symbol"], mkt["timeframe"], first_ts, last_ts + step)
     close = bars.set_index("timestamp")["close"].reindex(eq.index).ffill()
     benchmark = close / close.iloc[0] * float(eq.iloc[0])
 
-    metrics = compute_metrics(eq, trades, float(eq.iloc[0]), timeframe_ms(args.timeframe),
+    metrics = compute_metrics(eq, trades, float(eq.iloc[0]), step,
                               benchmark_return=float(benchmark.iloc[-1] / eq.iloc[0] - 1), fees=fees)
     days = (last_ts - first_ts) / 86_400_000
     title = (f"前向验证 | {args.run} | {days:.1f} 天 / {len(eq)} 根 K 线 / {len(fills)} 笔成交")
     print(format_metrics(metrics, title))
+    print(f"同期行情 {mkt['exchange']} {mkt['market']} {mkt['symbol']} {mkt['timeframe']}")
     print(f"{'同期买入持有':<16}{metrics['benchmark_return']:>+20.2%}")
     if days < 14:
         print(f"（样本只有 {days:.1f} 天：年化与夏普在这个长度上没有意义，只看收益、回撤、手续费和成交原因）")
@@ -144,7 +180,7 @@ def main() -> int:
             print(f"已实现盈亏合计 {sum(wins):+.2f} USDT，手续费合计 {fees:.2f} USDT")
         bar_open = dict(zip(bars["timestamp"].astype(int), bars["open"].astype(float)))
         print("\n滑点（bp，正数 = 不利）")
-        for line in slippage_report(fills, bar_open, timeframe_ms(args.timeframe)):
+        for line in slippage_report(fills, bar_open, step):
             print("  " + line)
 
     if args.out:
