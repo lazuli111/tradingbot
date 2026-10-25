@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import ccxt
+import pandas as pd
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
@@ -118,3 +119,49 @@ def test_slippage_report_numbers_and_checks():
 
 def test_slippage_report_without_usable_fills():
     assert fr.slippage_report([fill(1, "buy", 100.0)], {}, STEP)[-1] == "还没有可以算滑点的成交"
+
+
+def test_parse_run_handles_perp_and_spot_symbols():
+    assert fr.parse_run("testnet:binance:perp:SOL/USDT:USDT:4h:ma_cross") == {
+        "exchange": "binance", "market": "perp", "symbol": "SOL/USDT:USDT", "timeframe": "4h"}
+    assert fr.parse_run("paper:okx:spot:BTC/USDT:1h:donchian") == {
+        "exchange": "okx", "market": "spot", "symbol": "BTC/USDT", "timeframe": "1h"}
+    with pytest.raises(ValueError):
+        fr.parse_run("my-run")
+
+
+def test_market_of_prefers_flags_and_needs_them_for_unknown_run_names():
+    sol = "testnet:binance:perp:SOL/USDT:USDT:4h:ma_cross"
+    assert fr.market_of(sol)["symbol"] == "SOL/USDT:USDT"
+    assert fr.market_of(sol, symbol="ETH/USDT:USDT", timeframe="1h") == {
+        "exchange": "binance", "market": "perp", "symbol": "ETH/USDT:USDT", "timeframe": "1h"}
+    with pytest.raises(ValueError, match="--symbol / --timeframe"):
+        fr.market_of("my-run", exchange="binance")
+    assert fr.market_of("my-run", "okx", "BTC/USDT", "4h")["market"] == "spot"
+
+
+def test_report_fetches_the_runs_own_symbol(tmp_path, monkeypatch, capsys):
+    # 2026-10-25：SOL 的报告默认拿了 BTC 的 K 线，“vs K 线开盘价”算出 +9987 bp
+    sol = "testnet:binance:perp:SOL/USDT:USDT:4h:ma_cross"
+    db = tmp_path / "portfolio.db"
+    storage = Storage(db, sol)
+    bar = 10 * STEP
+    storage.record_equity(bar, 577.0)
+    storage.record_fill(Fill(bar + STEP + 18_000, "sell", 1.69, 102.33, 0.069, "signal", ref_price=102.24))
+    storage.record_equity(bar + STEP, 577.2)
+    storage.record_equity(bar + 2 * STEP, 578.8)
+    asked = {}
+
+    def fake_fetch(ex, symbol, timeframe, since, until):
+        asked.update(symbol=symbol, timeframe=timeframe)
+        return pd.DataFrame({"timestamp": [bar, bar + STEP, bar + 2 * STEP],
+                             "open": [101.0, 102.32, 101.6], "close": [102.3, 101.6, 101.2]})
+
+    monkeypatch.setattr(fr, "make_exchange", lambda ex, market: asked.update(exchange=ex, market=market))
+    monkeypatch.setattr(fr, "fetch_ohlcv_range", fake_fetch)
+    assert fr.main(["--db", str(db), "--run", sol]) == 0
+    assert asked == {"exchange": "binance", "market": "perp", "symbol": "SOL/USDT:USDT", "timeframe": "4h"}
+    out = capsys.readouterr().out
+    assert "同期行情 binance perp SOL/USDT:USDT 4h" in out
+    assert "市价单 vs 决策价     1 笔  平均 -8.8" in out
+    assert "市价单 vs K 线开盘价 1 笔  平均 -1.0" in out
