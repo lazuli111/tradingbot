@@ -8,6 +8,8 @@ from pathlib import Path
 import yaml
 from dotenv import load_dotenv
 
+from .halt import HALT_FILE
+
 MARKETS = ("spot", "perp")
 
 
@@ -44,6 +46,8 @@ class LiveConfig:
     # 多品种并行时，每个进程按“账户权益 × 这个比例”算仓位。1.0 = 独占账户；
     # 两个币各 0.5，就是把账户等分成两份，合起来敞口不超过 100%。
     equity_fraction: float = 1.0
+    # 组合层停机标志：tools/portfolio_guard.py 触发时写，存在时不开新仓（见 bot/halt.py）
+    halt_file: str = HALT_FILE
 
 
 @dataclass

@@ -23,11 +23,14 @@ log = logging.getLogger(__name__)
 
 class Trader:
     def __init__(self, risk: RiskManager, broker: Broker, allow_short: bool,
-                 on_fill: Callable[[Fill], None] | None = None):
+                 on_fill: Callable[[Fill], None] | None = None,
+                 halt_check: Callable[[], str | None] | None = None):
         self.risk = risk
         self.broker = broker
         self.allow_short = allow_short
         self.on_fill = on_fill
+        # 组合层停机（portfolio_guard 写的停机标志）：返回原因时不开新仓，平仓照常
+        self.halt_check = halt_check
         self.last_signal = 0                       # last direction we acted on
         self.pending: tuple[int, float] | None = None  # (target, atr) for the next open
         self.last_atr: float | None = None
@@ -105,10 +108,11 @@ class Trader:
                 return
         if target != 0:
             equity = self.broker.equity(price)
-            ok, why = self.risk.can_open(equity)
+            halted = self.halt_check() if self.halt_check else None
+            ok, why = (False, f"组合已停机（{halted}）") if halted else self.risk.can_open(equity)
             if not ok:
                 if why != self._blocked_reason:
-                    log.info("不开仓: %s", why)
+                    (log.warning if halted else log.info)("不开仓: %s", why)
                     self._blocked_reason = why
                 return  # last_signal unchanged, so we retry on the next bar
             self._blocked_reason = None

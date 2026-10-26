@@ -107,7 +107,8 @@ docker compose exec guard python tools/portfolio_guard.py --status   # 账户权
 | 看组合风险 | `python tools/portfolio_guard.py --status` |
 | 更新代码 | `git pull && docker compose up -d --build` |
 | 停机 | `docker compose down`（持仓留在交易所，但软止损会失效，建议先平仓） |
-| 闸门触发后恢复 | `python tools/portfolio_guard.py --resume`（先人工看过账户再执行） |
+| 闸门触发后恢复 | `python tools/portfolio_guard.py --resume`（先人工看过账户再执行；会删掉停机标志 `data/HALT`） |
+| 让机器人停止开新仓（不平仓） | 建 `data/HALT`，内容写原因（服务器上：`sudo -u tradingbot sh -c 'echo 原因 > /opt/tradingbot/data/HALT'`）；平仓和止损照常。删掉这个文件即恢复 |
 | 改品种 | 改 `docker-compose.yml` 里的 `--symbol` 和 `equity_fraction`，再 `up -d` |
 
 ## 8. 安全清单
