@@ -3,9 +3,12 @@
 每 30 秒由 tools/forward_bot.ps1 调一次 `--once`。峰值记在 data/portfolio_guard.json，
 所以重启不会丢；触发后写 halted=true，之后只报告、不再交易（要 `--resume` 人工恢复）。
 
+触发时先写停机标志 data/HALT（见 bot/halt.py）再清仓：机器人开新仓前都会检查它，所以信号
+再翻转也不会重新开仓。`--resume` 会删掉它。人工建这个文件也能让机器人停止开仓，`--status` 会显示。
+
     python tools/portfolio_guard.py --status     # 看一眼：权益、峰值、回撤、持仓
     python tools/portfolio_guard.py --once       # 检查一次，必要时清仓
-    python tools/portfolio_guard.py --resume     # 解除停机，峰值重置为当前权益
+    python tools/portfolio_guard.py --resume     # 解除停机（删掉 data/HALT），峰值重置为当前权益
 """
 from __future__ import annotations
 
@@ -22,8 +25,10 @@ import ccxt  # noqa: E402
 from dotenv import load_dotenv  # noqa: E402
 
 from bot.config import api_credentials  # noqa: E402
+from bot.halt import HALT_FILE, clear_halt, halt_reason, write_halt  # noqa: E402
 
 STATE = Path("data/portfolio_guard.json")
+HALT = Path(HALT_FILE)
 
 
 def make_demo_exchange(exchange_id: str, creds: dict):
@@ -92,16 +97,22 @@ def check(ex, args) -> int:
     if args.resume:
         state = {"peak": equity, "halted": False, "reason": None, "updated": None}
         save_state(state)
-        print(f"{now()}  已解除停机，峰值重置为 {equity:.2f}")
+        removed = clear_halt(HALT)
+        print(f"{now()}  已解除停机{'（已删除 ' + str(HALT) + '）' if removed else ''}，峰值重置为 {equity:.2f}")
         return 0
 
     if equity > state["peak"]:
         state["peak"] = equity
     dd = equity / state["peak"] - 1 if state["peak"] else 0.0
+    flag = halt_reason(HALT)
 
     line = (f"{now()}  权益 {equity:.2f}  峰值 {state['peak']:.2f}  回撤 {dd:+.2%}  "
             f"持仓 {len(positions)}  免费 {float(balance.get('free') or 0):.2f}")
-    print(line + ("  [已停机]" if state["halted"] else ""), flush=True)
+    if state["halted"]:
+        line += "  [已停机]"
+    elif flag:
+        line += f"  [停机标志：{flag}，机器人不开新仓]"
+    print(line, flush=True)
 
     if args.status:
         for p in positions:
@@ -114,14 +125,18 @@ def check(ex, args) -> int:
         return 0
 
     if state["halted"]:
+        if flag is None:  # 停机标志被删了，或者是加这个标志之前就停机的：补上，机器人才会停止开仓
+            write_halt(state.get("reason") or "组合已停机", HALT)
+            print(f"{now()}  已停机但没有 {HALT}，已补写", flush=True)
         save_state(state)
         return 0
 
     if dd <= -args.max_dd:
+        reason = f"组合回撤 {dd:.2%}（阈值 {args.max_dd:.0%}）"
         print(f"{now()}  组合回撤 {dd:.2%} 触发阈值 {args.max_dd:.0%}，清仓并停机")
+        write_halt(reason, HALT)  # 先挡住新开仓，再清仓
         closed = flatten(ex)
-        state.update(halted=True, reason=f"组合回撤 {dd:.2%}（阈值 {args.max_dd:.0%}）",
-                     updated=None, closed=closed)
+        state.update(halted=True, reason=reason, updated=None, closed=closed)
         save_state(state)
         return 3
 

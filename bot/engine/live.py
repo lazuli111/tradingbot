@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import logging
 import time
+from functools import partial
 
 import pandas as pd
 
 from ..broker import Broker, Fill, SimBroker
 from ..config import Config, api_credentials
 from ..data import fetch_funding_range, fetch_ohlcv_range, make_exchange, timeframe_ms
+from ..halt import halt_reason
 from ..indicators import atr as compute_atr
 from ..risk import RiskManager
 from ..storage import Storage
@@ -58,7 +60,8 @@ class LiveRunner:
             broker = FractionalEquityBroker(broker, cfg.live.equity_fraction)
             log.info("按账户权益的 %.0f%% 计算仓位（多品种并行）", cfg.live.equity_fraction * 100)
         risk = RiskManager(cfg.risk, cfg.is_perp, cfg.initial_equity)
-        self.trader = Trader(risk, broker, allow_short=cfg.is_perp, on_fill=self._on_fill)
+        self.trader = Trader(risk, broker, allow_short=cfg.is_perp, on_fill=self._on_fill,
+                             halt_check=partial(halt_reason, cfg.live.halt_file))
 
         saved = self.storage.load_state()
         if saved:
