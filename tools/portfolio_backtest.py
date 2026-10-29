@@ -23,14 +23,32 @@ from bot.metrics import compute_metrics  # noqa: E402
 from bot.report import format_metrics  # noqa: E402
 
 
+def run_sleeves(sleeves: dict) -> dict:
+    """{币种: (cfg, df, funding)} 各跑一遍回测，再把起点对齐到最晚开始交易的那个币。
+
+    上市晚的币开始交易得晚。老币若从自己的起点算，组合第一根 K 线就带着它此前的盈亏，
+    成交和熔断状态也是之前攒下的。所以老币用 start_ts 从共同起点重跑：之前的 K 线只用来预热指标，
+    每个币从同一根 K 线、拿同一份 1/N 本金开始。
+    """
+    results = {sym: run_backtest(*args) for sym, args in sleeves.items()}
+    start = max(int(res.equity.index[0]) for res in results.values())
+    early = [sym for sym, res in results.items() if res.equity.index[0] < start]
+    if early:
+        when = pd.Timestamp(start, unit="ms", tz="UTC")
+        print(f"各币从 {when:%Y-%m-%d %H:%M} UTC 起同时交易；{', '.join(early)} 此前的 K 线只用于预热\n")
+    return {sym: run_backtest(*sleeves[sym], start_ts=start) if sym in early else res
+            for sym, res in results.items()}
+
+
 def combine(equity_parts: dict, close_parts: dict, total_capital: float) -> tuple[pd.Series, pd.Series]:
     """各币权益相加成组合权益；收盘价归一后取均值，作为等权买入持有基准。
 
     整数时间戳索引 concat 后不会排序：上市晚的币排在前面时，排在后面的老币独有的早期 K 线
     会被追加到末尾，ffill 后末尾几行全是错位的数，所以先 sort_index 再 ffill。
+    基准截到组合的起点再归一：从老币的起点归一的话，晚上线的币第一行是 NaN，整列被 mean 悄悄丢掉。
     """
     port = pd.concat(equity_parts.values(), axis=1).sort_index().ffill().dropna()
-    basket = pd.concat(close_parts.values(), axis=1).sort_index().ffill()
+    basket = pd.concat(close_parts.values(), axis=1).sort_index().ffill().loc[port.index[0]:]
     return port.sum(axis=1), (basket / basket.iloc[0]).mean(axis=1) * total_capital
 
 
@@ -48,7 +66,7 @@ def main() -> int:
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
     weight = 1.0 / len(symbols)
     equity_parts, close_parts, bench_parts, trades, rows = {}, {}, {}, [], []
-    total_capital = None
+    sleeves, total_capital = {}, None
 
     for sym in symbols:
         cfg = load_config(args.config, {"exchange": args.exchange, "market": args.market,
@@ -58,7 +76,10 @@ def main() -> int:
         ex = make_exchange(cfg.exchange, cfg.market)
         df = load_ohlcv(cfg, args.since, args.until, ex)
         funding = load_funding(cfg, args.since, args.until, ex) if cfg.is_perp else None
-        res = run_backtest(cfg, df, funding)
+        sleeves[sym] = (cfg, df, funding)
+
+    for sym, res in run_sleeves(sleeves).items():
+        df = sleeves[sym][1]
         equity_parts[sym] = res.equity
         close_parts[sym] = df.set_index("timestamp")["close"].reindex(res.equity.index).ffill()
         trades += res.trades
