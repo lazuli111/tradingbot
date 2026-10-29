@@ -23,6 +23,17 @@ from bot.metrics import compute_metrics  # noqa: E402
 from bot.report import format_metrics  # noqa: E402
 
 
+def combine(equity_parts: dict, close_parts: dict, total_capital: float) -> tuple[pd.Series, pd.Series]:
+    """各币权益相加成组合权益；收盘价归一后取均值，作为等权买入持有基准。
+
+    整数时间戳索引 concat 后不会排序：上市晚的币排在前面时，排在后面的老币独有的早期 K 线
+    会被追加到末尾，ffill 后末尾几行全是错位的数，所以先 sort_index 再 ffill。
+    """
+    port = pd.concat(equity_parts.values(), axis=1).sort_index().ffill().dropna()
+    basket = pd.concat(close_parts.values(), axis=1).sort_index().ffill()
+    return port.sum(axis=1), (basket / basket.iloc[0]).mean(axis=1) * total_capital
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="等权组合回测")
     ap.add_argument("--symbols", default="BTC/USDT,ETH/USDT,SOL/USDT")
@@ -53,10 +64,7 @@ def main() -> int:
         trades += res.trades
         rows.append((sym, res.metrics))
 
-    port = pd.concat(equity_parts.values(), axis=1).ffill().dropna()
-    port_equity = port.sum(axis=1)
-    basket = pd.concat(close_parts.values(), axis=1).ffill()
-    basket = (basket / basket.iloc[0]).mean(axis=1) * total_capital
+    port_equity, basket = combine(equity_parts, close_parts, total_capital)
 
     print(f"{'币种':<10}{'收益':>10}{'夏普':>8}{'回撤':>10}{'交易':>6}{'资金费':>10}  熔断")
     for sym, m in rows:
