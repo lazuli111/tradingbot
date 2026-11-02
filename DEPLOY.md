@@ -225,7 +225,7 @@ sudo systemctl disable --now tradingbot-dashboard && sudo rm /etc/systemd/system
 - 哪个仓位归哪个闸门，看 ccxt 统一 symbol 冒号后的结算币（ccxt 取自 Binance 的 `marginAsset`）。`--status`、`--flatten`、`--resume` 和自动清仓都只作用于自己那一套。
 - **USDT 闸门唯一的行为变化**：以前触发时平掉账户里**所有**仓位，现在只平 USDT 保证金的仓位，USDC 仓位不动；`--status` 里的“持仓 N”也只数 USDT 仓位。账户里只有 USDT 仓位时，输出、状态文件、停机标志和下单都和以前一样。
 - 前提：Demo 账户是**单资产模式**（不是联合保证金 / Multi-Assets）。联合保证金模式下两种资产的盈亏会互相影响，分开管就没有意义了。
-- USDC 的回撤阈值**用户还没定**。unit 里先写 `--max-dd 0.20`，安装前按用户的决定改。
+- USDC 的回撤阈值和 USDT 一样是 20%（用户 2026-11-02 定），unit 里写明了 `--max-dd 0.20`。
 - 看板目前只读 USDT 闸门的日志和状态，不显示 USDC。
 
 ### 安装（admin 执行一次）
@@ -234,8 +234,6 @@ sudo systemctl disable --now tradingbot-dashboard && sudo rm /etc/systemd/system
 
 ```bash
 sudo -u tradingbot git -C /opt/tradingbot pull --ff-only
-# 先确认 --max-dd：用户定了别的阈值，就改 ExecStart 那一行再复制
-grep ExecStart /opt/tradingbot/deploy/systemd/tradingbot-guard-usdc.service
 sudo cp /opt/tradingbot/deploy/systemd/tradingbot-guard-usdc.service /opt/tradingbot/deploy/systemd/tradingbot-guard-usdc.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 systemctl list-timers 'tradingbot-guard*' --no-pager       # 看 tradingbot-guard.timer 的 LAST
