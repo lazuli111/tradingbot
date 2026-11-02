@@ -10,5 +10,6 @@ logs/
 config.*.yaml
 !config.forward.example.yaml
 !config.portfolio.example.yaml
+!config.usdc-basket.example.yaml
 _deploy.tar.gz
 .cache/

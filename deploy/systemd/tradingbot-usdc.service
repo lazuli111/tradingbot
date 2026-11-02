@@ -1,0 +1,29 @@
+[Unit]
+Description=Trading bot forward test - USDC basket, 9 coins in one process (Binance demo)
+# 和 tradingbot-btc / tradingbot-sol（USDT）并行，同一个 Demo 账户、各用各的保证金资产。
+# 安装步骤见 DEPLOY.md 第 12 节；启动前 USDC 的 portfolio_guard 要先装好。
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tradingbot
+WorkingDirectory=/opt/tradingbot
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=OMP_NUM_THREADS=1
+ExecStart=/opt/tradingbot/.venv/bin/python main.py testnet-multi --config config.usdc-basket.yaml
+Restart=always
+RestartSec=30
+# 内存：9 个币共用两个 ccxt 实例，本机实测只比单币进程多约 3 MB，所以按单币进程估（服务器上
+# 稳定约 340~356 MB，启动拉市场表时更高；MemoryMax=450M 当年太紧，见 HANDOVER“踩过的坑”2）。
+# 600M 是先给的上限，部署后看 memory.peak 再收紧（DEPLOY.md 第 12 节）。
+# 内存不够时先杀这个服务，不拖累 USDT 的两个机器人。
+MemoryMax=600M
+OOMScoreAdjust=500
+StandardOutput=append:/var/log/tradingbot-usdc.log
+StandardError=append:/var/log/tradingbot-usdc.log
+
+[Install]
+WantedBy=multi-user.target

@@ -42,8 +42,20 @@ class FractionalEquityBroker:
         return getattr(self._inner, name)
 
 
+def make_trade_exchange(cfg: Config):
+    """The signed testnet / demo-trading connection orders go through."""
+    creds = api_credentials(cfg.exchange)
+    if not {"apiKey", "secret"} <= creds.keys():
+        raise RuntimeError(f"缺少测试网 API Key：请在 .env 中设置 {cfg.exchange.upper()}_API_KEY / "
+                           f"{cfg.exchange.upper()}_API_SECRET")
+    return make_exchange(cfg.exchange, cfg.market, creds, testnet=True)
+
+
 class LiveRunner:
-    def __init__(self, cfg: Config, mode: str):
+    """One symbol. `data_ex` / `trade_ex` let several runners share one ccxt instance each
+    (live_multi.py: load_markets is what takes the memory); left out, the runner makes its own."""
+
+    def __init__(self, cfg: Config, mode: str, data_ex=None, trade_ex=None):
         if mode not in ("paper", "testnet"):
             raise ValueError("mode 只能是 paper 或 testnet")
         self.cfg = cfg
@@ -51,7 +63,9 @@ class LiveRunner:
         self.symbol = cfg.market_symbol
         self.step = timeframe_ms(cfg.timeframe)
         self.strategy = create_strategy(cfg.strategy.name, cfg.strategy.params)
-        self.data_ex = make_exchange(cfg.exchange, cfg.market)  # public market data
+        # public market data
+        self.data_ex = data_ex if data_ex is not None else make_exchange(cfg.exchange, cfg.market)
+        self._trade_ex = trade_ex
 
         run = f"{mode}:{cfg.exchange}:{cfg.market}:{self.symbol}:{cfg.timeframe}:{self.strategy.name}"
         self.storage = Storage(cfg.live.db_path, run)
@@ -87,11 +101,7 @@ class LiveRunner:
                              leverage, cfg.maintenance_margin_rate)
         from ..broker.ccxt_broker import CcxtBroker
 
-        creds = api_credentials(cfg.exchange)
-        if not {"apiKey", "secret"} <= creds.keys():
-            raise RuntimeError(f"缺少测试网 API Key：请在 .env 中设置 {cfg.exchange.upper()}_API_KEY / "
-                               f"{cfg.exchange.upper()}_API_SECRET")
-        trade_ex = make_exchange(cfg.exchange, cfg.market, creds, testnet=True)
+        trade_ex = self._trade_ex if self._trade_ex is not None else make_trade_exchange(cfg)
         return CcxtBroker(trade_ex, self.symbol, cfg.is_perp, leverage, testnet=True)
 
     # ---- callbacks -----------------------------------------------------
@@ -203,15 +213,20 @@ class LiveRunner:
             self._needs_reconcile = True
         return new_bar
 
-    def run(self, max_bars: int | None = None) -> None:
-        log.info("启动 %s 模式: %s %s %s 策略 %s", self.mode, self.cfg.exchange, self.symbol,
-                 self.cfg.timeframe, self.strategy)
+    def start(self) -> None:
+        """Load the history, then act on the latest closed bar right away. A failure to load
+        the history propagates; one while acting on the bar is retried by the next poll."""
         self._load_history()
         try:
-            self._on_bar_closed()  # act on the latest closed bar right away
+            self._on_bar_closed()
         except Exception:
             log.exception("启动时处理最新 K 线出错：下一轮先与交易所核对持仓，再重试")
             self._needs_reconcile = True
+
+    def run(self, max_bars: int | None = None) -> None:
+        log.info("启动 %s 模式: %s %s %s 策略 %s", self.mode, self.cfg.exchange, self.symbol,
+                 self.cfg.timeframe, self.strategy)
+        self.start()
         processed = 0
         try:
             while max_bars is None or processed < max_bars:

@@ -1,0 +1,42 @@
+# USDC 平行前向测试（Binance Demo）：9 个币的篮子在一个进程里跑，每笔风险 3%，
+# 和 USDT 的 BTC + SOL 两个机器人（config.portfolio.yaml，每笔 1%）在同一个 Demo 账户上并行。
+# USDT 那边不动；这里用账户里的 USDC 做保证金（X/USDC 会变成 X/USDC:USDC 永续，权益读 USDC 余额）。
+# 启动：python main.py testnet-multi --config config.usdc-basket.yaml
+# 服务器：deploy/systemd/tradingbot-usdc.service，安装步骤见 DEPLOY.md 第 12 节
+exchange: binance
+market: perp
+symbol: BTC/USDC             # 单币入口才用；testnet-multi 跑下面的 symbols
+symbols: [BTC/USDC, SOL/USDC, ETH/USDC, XRP/USDC, LTC/USDC, BCH/USDC, ADA/USDC, LINK/USDC, BNB/USDC]
+timeframe: 4h
+initial_equity: 5000         # Demo 上按账户 USDC 余额 × equity_fraction 下单，这个数只是起始参考
+slippage: 0.0005
+maintenance_margin_rate: 0.004
+
+fees:
+  spot: 0.001
+  perp: 0.0005
+
+strategy:                    # 和 config.portfolio.example.yaml 一样，前向测试期间不调参
+  name: ma_cross
+  params:
+    fast: 20
+    slow: 50
+    adx_min: 20
+
+risk:
+  risk_per_trade: 0.03       # USDT 那边是 0.01
+  atr_period: 14
+  stop_atr_mult: 2.0
+  take_profit_atr_mult: null
+  leverage: 3                # 3% 风险时 1 倍上限会卡住仓位
+  max_leverage: 3
+  max_position_pct: 1.0
+  daily_loss_limit: 0.03
+  max_drawdown: 0.99         # 单币永久熔断关掉，组合层由 USDC 的 portfolio_guard 负责
+
+live:
+  poll_seconds: 30
+  warmup_bars: 300
+  db_path: data/usdc_basket.db
+  equity_fraction: 0.111111  # 1/9：每个币用账户 USDC 权益的九分之一
+  halt_file: data/HALT_USDC  # USDC 的 portfolio_guard 写这个文件；不要和 USDT 的 data/HALT 共用
