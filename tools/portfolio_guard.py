@@ -6,9 +6,16 @@
 触发时先写停机标志 data/HALT（见 bot/halt.py）再清仓：机器人开新仓前都会检查它，所以信号
 再翻转也不会重新开仓。`--resume` 会删掉它。人工建这个文件也能让机器人停止开仓，`--status` 会显示。
 
+按保证金资产分开管（`--asset`，默认 USDT）：同一个合约账户里 USDT 机器人和 USDC 机器人各有一个闸门，
+权益只读这个资产的余额，持仓 / 清仓只看用这个资产做保证金的仓位，状态文件和停机标志也各用各的：
+
+    USDT  data/portfolio_guard.json       data/HALT
+    USDC  data/portfolio_guard_usdc.json  data/HALT_USDC   （USDC 机器人配置 live.halt_file 同名）
+
     python tools/portfolio_guard.py --status     # 看一眼：权益、峰值、回撤、持仓
     python tools/portfolio_guard.py --once       # 检查一次，必要时清仓
     python tools/portfolio_guard.py --resume     # 解除停机（删掉 data/HALT），峰值重置为当前权益
+    python tools/portfolio_guard.py --asset USDC --status   # USDC 那一套，其它参数同理
 """
 from __future__ import annotations
 
@@ -29,6 +36,14 @@ from bot.halt import HALT_FILE, clear_halt, halt_reason, write_halt  # noqa: E40
 
 STATE = Path("data/portfolio_guard.json")
 HALT = Path(HALT_FILE)
+STATE_USDC = Path("data/portfolio_guard_usdc.json")
+HALT_USDC = Path("data/HALT_USDC")
+ASSETS = ("USDT", "USDC")
+
+
+def files_for(asset: str) -> tuple[Path, Path]:
+    """(状态文件, 停机标志)。调用时才取模块变量，测试 monkeypatch 了也认。"""
+    return {"USDT": (STATE, HALT), "USDC": (STATE_USDC, HALT_USDC)}[asset]
 
 
 def make_demo_exchange(exchange_id: str, creds: dict):
@@ -51,28 +66,41 @@ def now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def load_state(equity: float) -> dict:
-    if STATE.exists():
+def load_state(equity: float, path: Path | None = None) -> dict:
+    path = path or STATE
+    if path.exists():
         try:
-            return json.loads(STATE.read_text(encoding="utf-8"))
+            return json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             pass
     return {"peak": equity, "halted": False, "reason": None, "updated": None}
 
 
-def save_state(state: dict) -> None:
-    STATE.parent.mkdir(parents=True, exist_ok=True)
+def save_state(state: dict, path: Path | None = None) -> None:
+    path = path or STATE
+    path.parent.mkdir(parents=True, exist_ok=True)
     state["updated"] = now()
-    STATE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def open_positions(ex) -> list[dict]:
-    return [p for p in ex.fetch_positions() if float(p.get("contracts") or 0)]
+def margin_asset(position: dict) -> str | None:
+    """仓位用哪个资产做保证金：ccxt 统一 symbol 冒号后的结算币（BTC/USDC:USDC → USDC，
+    交割合约 BTC/USDT:USDT-261225 → USDT）。ccxt 的结算币取自 Binance exchangeInfo 的 marginAsset，
+    机器人下单用的也是这个 symbol。没有冒号的（不是合约）不归任何一个闸门管。"""
+    symbol = position.get("symbol") or ""
+    if ":" not in symbol:
+        return None
+    return symbol.split(":", 1)[1].split("-", 1)[0]
 
 
-def flatten(ex) -> int:
+def open_positions(ex, asset: str = "USDT") -> list[dict]:
+    return [p for p in ex.fetch_positions()
+            if float(p.get("contracts") or 0) and margin_asset(p) == asset]
+
+
+def flatten(ex, asset: str = "USDT") -> int:
     closed = 0
-    for p in open_positions(ex):
+    for p in open_positions(ex, asset):
         symbol, qty = p["symbol"], float(p["contracts"])
         side = "sell" if p["side"] == "long" else "buy"
         try:
@@ -88,23 +116,26 @@ def flatten(ex) -> int:
 
 
 def check(ex, args) -> int:
-    """报告一次；需要时清仓并停机。返回 0 正常、3 触发停机、1 缺配置。"""
-    balance = ex.fetch_balance()["USDT"]
+    """报告一次；需要时清仓并停机。返回 0 正常、3 触发停机、1 缺配置。
+    只看 args.asset 这一个保证金资产（缺省 USDT）：别的资产的权益、仓位、状态和停机标志都不碰。"""
+    asset = getattr(args, "asset", "USDT")
+    state_path, halt_path = files_for(asset)
+    balance = ex.fetch_balance()[asset]
     equity = float(balance.get("total") or 0)
-    positions = open_positions(ex)
-    state = load_state(equity)
+    positions = open_positions(ex, asset)
+    state = load_state(equity, state_path)
 
     if args.resume:
         state = {"peak": equity, "halted": False, "reason": None, "updated": None}
-        save_state(state)
-        removed = clear_halt(HALT)
-        print(f"{now()}  已解除停机{'（已删除 ' + str(HALT) + '）' if removed else ''}，峰值重置为 {equity:.2f}")
+        save_state(state, state_path)
+        removed = clear_halt(halt_path)
+        print(f"{now()}  已解除停机{'（已删除 ' + str(halt_path) + '）' if removed else ''}，峰值重置为 {equity:.2f}")
         return 0
 
     if equity > state["peak"]:
         state["peak"] = equity
     dd = equity / state["peak"] - 1 if state["peak"] else 0.0
-    flag = halt_reason(HALT)
+    flag = halt_reason(halt_path)
 
     line = (f"{now()}  权益 {equity:.2f}  峰值 {state['peak']:.2f}  回撤 {dd:+.2%}  "
             f"持仓 {len(positions)}  免费 {float(balance.get('free') or 0):.2f}")
@@ -121,26 +152,26 @@ def check(ex, args) -> int:
 
     if args.flatten:
         print(f"{now()}  手动清仓，共 {len(positions)} 个仓位")
-        flatten(ex)
+        flatten(ex, asset)
         return 0
 
     if state["halted"]:
         if flag is None:  # 停机标志被删了，或者是加这个标志之前就停机的：补上，机器人才会停止开仓
-            write_halt(state.get("reason") or "组合已停机", HALT)
-            print(f"{now()}  已停机但没有 {HALT}，已补写", flush=True)
-        save_state(state)
+            write_halt(state.get("reason") or "组合已停机", halt_path)
+            print(f"{now()}  已停机但没有 {halt_path}，已补写", flush=True)
+        save_state(state, state_path)
         return 0
 
     if dd <= -args.max_dd:
         reason = f"组合回撤 {dd:.2%}（阈值 {args.max_dd:.0%}）"
         print(f"{now()}  组合回撤 {dd:.2%} 触发阈值 {args.max_dd:.0%}，清仓并停机")
-        write_halt(reason, HALT)  # 先挡住新开仓，再清仓
-        closed = flatten(ex)
+        write_halt(reason, halt_path)  # 先挡住新开仓，再清仓
+        closed = flatten(ex, asset)
         state.update(halted=True, reason=reason, updated=None, closed=closed)
-        save_state(state)
+        save_state(state, state_path)
         return 3
 
-    save_state(state)
+    save_state(state, state_path)
     return 0
 
 
@@ -150,8 +181,10 @@ def main() -> int:
     ap.add_argument("--loop", type=int, metavar="SECONDS", help="常驻：每 N 秒检查一次")
     ap.add_argument("--status", action="store_true", help="只报告")
     ap.add_argument("--resume", action="store_true", help="解除停机状态")
-    ap.add_argument("--flatten", action="store_true", help="立即市价平掉所有仓位（不改停机状态）")
+    ap.add_argument("--flatten", action="store_true", help="立即市价平掉这个资产的所有仓位（不改停机状态）")
     ap.add_argument("--max-dd", type=float, default=0.20, help="组合回撤阈值")
+    ap.add_argument("--asset", type=str.upper, choices=ASSETS, default="USDT",
+                    help="保证金资产：权益、仓位、状态文件和停机标志都只看这一个（默认 USDT）")
     ap.add_argument("--exchange", default="binance")
     args = ap.parse_args()
 

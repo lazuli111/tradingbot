@@ -216,7 +216,7 @@ sudo systemctl disable --now tradingbot-dashboard && sudo rm /etc/systemd/system
 
 ### 启动之前（缺一不可）
 
-1. **USDC 的 portfolio_guard 已经部署**（guard 按 USDT / USDC 拆开的那个 PR）。没有它，USDC 篮子没有 20% 组合停机线；而且旧 guard 触发时会平掉账户里**所有**仓位，USDC 的也会被平。
+1. **USDC 的 portfolio_guard 已经部署**（第 13 节）。没有它，USDC 篮子没有 20% 组合停机线；而且旧 guard 触发时会平掉账户里**所有**仓位，USDC 的也会被平。
 2. Demo 账户是**单资产模式**（不是联合保证金 / Multi-Assets）：联合保证金不支持逐仓，USDT 和 USDC 的盈亏也会互相影响。
 3. `free -m` 的 available 至少约 450 MB（现在约 470 MB）。
 
@@ -281,3 +281,76 @@ Binance U 本位按 IP 每分钟 2400 权重；行情走正式站（公开接口
 ### 停止开新仓 / 恢复
 
 和 USDT 一样，只是文件换成 `data/HALT_USDC`：建这个文件就不再开新仓，平仓和止损照常；删掉恢复。`data/HALT`（USDT 的）对 USDC 篮子不起作用，反过来也一样。
+
+
+## 13. USDC 组合闸门（`portfolio_guard.py --asset USDC`）
+
+同一个 Binance Demo 合约账户里，USDT 机器人（BTC + SOL）和 USDC 机器人（9 币篮子）各有一个闸门，按保证金资产分开，互不影响：
+
+| | USDT（现有） | USDC（新增） |
+| --- | --- | --- |
+| 命令 | `portfolio_guard.py`（缺省就是 `--asset USDT`） | `portfolio_guard.py --asset USDC` |
+| 权益 | 只读 USDT 余额 | 只读 USDC 余额 |
+| 管哪些仓位 | symbol 以 `:USDT` 结尾的（`BTC/USDT:USDT`） | symbol 以 `:USDC` 结尾的（`BTC/USDC:USDC`） |
+| 状态文件 | `data/portfolio_guard.json` | `data/portfolio_guard_usdc.json` |
+| 停机标志 | `data/HALT` | `data/HALT_USDC`（USDC 机器人配置 `live.halt_file` 同名，不要改） |
+| systemd | `tradingbot-guard.service` / `.timer` | `tradingbot-guard-usdc.service` / `.timer` |
+| 日志 | `/var/log/tradingbot-guard.log` | `/var/log/tradingbot-guard-usdc.log` |
+
+- 哪个仓位归哪个闸门，看 ccxt 统一 symbol 冒号后的结算币（ccxt 取自 Binance 的 `marginAsset`）。`--status`、`--flatten`、`--resume` 和自动清仓都只作用于自己那一套。
+- **USDT 闸门唯一的行为变化**：以前触发时平掉账户里**所有**仓位，现在只平 USDT 保证金的仓位，USDC 仓位不动；`--status` 里的“持仓 N”也只数 USDT 仓位。账户里只有 USDT 仓位时，输出、状态文件、停机标志和下单都和以前一样。
+- 前提：Demo 账户是**单资产模式**（不是联合保证金 / Multi-Assets）。联合保证金模式下两种资产的盈亏会互相影响，分开管就没有意义了。
+- USDC 的回撤阈值和 USDT 一样是 20%（用户 2026-11-02 定），unit 里写明了 `--max-dd 0.20`。
+- 看板目前只读 USDT 闸门的日志和状态，不显示 USDC。
+
+### 安装（admin 执行一次）
+
+两个 Python 进程不要同时跑，所以 USDC 闸门比 USDT 闸门晚约 2.5 分钟：开机后分别在 2 分钟、4 分 30 秒时第一次运行，之后各自每 5 分钟一次。机器已经开着时，`enable --now` 会立刻运行一次，之后按那一刻每 5 分钟一次，所以要挑时间启用。
+
+```bash
+sudo -u tradingbot git -C /opt/tradingbot pull --ff-only
+sudo cp /opt/tradingbot/deploy/systemd/tradingbot-guard-usdc.service /opt/tradingbot/deploy/systemd/tradingbot-guard-usdc.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+systemctl list-timers 'tradingbot-guard*' --no-pager       # 看 tradingbot-guard.timer 的 LAST
+# 等 USDT 闸门上一次运行过去约 2.5 分钟，再执行下面这行
+sudo systemctl enable --now tradingbot-guard-usdc.timer
+```
+
+验证：
+
+```bash
+systemctl list-timers 'tradingbot-guard*' --no-pager       # 两个 timer 的 NEXT 相差约 2.5 分钟
+tail -n 3 /var/log/tradingbot-guard-usdc.log                # 权益是 USDC 余额（约 5000），持仓只数 USDC 仓位
+tail -n 3 /var/log/tradingbot-guard.log                     # USDT 那边照旧
+```
+
+- 最好在 USDC 机器人开第一笔仓之前装好，峰值从起始的 5000 USDC 算起。
+- USDT 闸门是 oneshot，`git pull` 之后下一次定时运行就是新代码，不用重启任何服务。
+
+**给 claude-ops 的 sudoers 规则**（和现有 `--status` 那条同一写法；sudo 按参数逐字匹配，顺序不能变）：
+
+```bash
+sudo visudo -f /etc/sudoers.d/claude-ops-guard-usdc
+```
+
+文件内容一行：
+
+```
+claude-ops ALL=(tradingbot) NOPASSWD: /opt/tradingbot/.venv/bin/python tools/portfolio_guard.py --asset USDC --status
+```
+
+claude-ops 这样用：
+
+```bash
+cd /opt/tradingbot && sudo -n -u tradingbot .venv/bin/python tools/portfolio_guard.py --asset USDC --status
+```
+
+### 日常运维（USDC）
+
+| 动作 | 命令（在 `/opt/tradingbot`，以 tradingbot 身份） |
+| --- | --- |
+| 看 USDC 组合风险 | `python tools/portfolio_guard.py --asset USDC --status` |
+| USDC 闸门触发后恢复 | `python tools/portfolio_guard.py --asset USDC --resume`（只删 `data/HALT_USDC`，USDT 的 `data/HALT` 不动） |
+| 手动平掉 USDC 仓位 | `python tools/portfolio_guard.py --asset USDC --flatten`（不改停机状态） |
+| 只让 USDC 机器人停止开新仓 | 建 `data/HALT_USDC`，内容写原因 |
+| 卸载 | `sudo systemctl disable --now tradingbot-guard-usdc.timer && sudo rm /etc/systemd/system/tradingbot-guard-usdc.{service,timer} && sudo systemctl daemon-reload` |
