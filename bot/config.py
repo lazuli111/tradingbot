@@ -55,6 +55,8 @@ class Config:
     exchange: str = "binance"
     market: str = "spot"
     symbol: str = "BTC/USDT"
+    # testnet-multi 在一个进程里跑这些币（每个币按 live.equity_fraction 分权益）；单币入口不看它
+    symbols: list[str] = field(default_factory=list)
     timeframe: str = "1h"
     initial_equity: float = 10000.0
     slippage: float = 0.0005
@@ -98,6 +100,8 @@ class Config:
             raise ValueError("max_drawdown / daily_loss_limit 应在 (0, 1) 之间")
         if not 0 < self.live.equity_fraction <= 1:
             raise ValueError("live.equity_fraction 应在 (0, 1] 之间")
+        if self.symbols:
+            self._validate_symbols()
         if self.is_perp:
             if not 1 <= r.leverage <= r.max_leverage:
                 raise ValueError(f"leverage={r.leverage} 超出允许范围 [1, {r.max_leverage}]")
@@ -106,6 +110,21 @@ class Config:
                 raise ValueError("现货不支持杠杆，leverage 必须为 1")
             if not 0 < r.max_position_pct <= 1:
                 raise ValueError("现货 max_position_pct 应在 (0, 1] 之间")
+
+    def _validate_symbols(self) -> None:
+        bad = [s for s in self.symbols if "/" not in s]
+        if bad:
+            raise ValueError(f"symbols 格式应为 BASE/QUOTE，有问题的: {bad}")
+        bases = [s.split(":")[0] for s in self.symbols]
+        if len(set(bases)) != len(bases):
+            raise ValueError(f"symbols 有重复: {self.symbols}")
+        quotes = {b.split("/")[1] for b in bases}
+        if len(quotes) > 1:  # equity_fraction 是同一个保证金资产里的份额
+            raise ValueError(f"symbols 的计价币要一致，当前有 {sorted(quotes)}")
+        total = self.live.equity_fraction * len(self.symbols)
+        if total > 1 + 1e-6:
+            raise ValueError(f"{len(self.symbols)} 个币 × equity_fraction {self.live.equity_fraction:g} "
+                             f"= {total:.0%}，超过账户权益；N 个币填 1/N 或更小")
 
 
 def _build(cls, data: dict | None):

@@ -334,6 +334,8 @@ New-Item logs\forward_bot.stop
   sudo tail -f /var/log/tradingbot-btc.log
   ```
 
+**USDC 篮子（2026-11-02 写好，未部署）**：同一个 Demo 账户上用 USDC 跑 9 个币、每笔风险 3%，一个进程跑完（`main.py testnet-multi`，`tradingbot-usdc.service`，日志 `/var/log/tradingbot-usdc.log`，账本 `data/usdc_basket.db`，停机标志 `data/HALT_USDC`）。USDT 的两个服务不受影响。前提、安装、内存和请求频率见 `DEPLOY.md` 第 12 节。
+
 **踩过的坑（都付出过停机代价）**：
 
 1. **1 GiB 只能跑一个品种**。最初在 2 核 1 GiB 上同时起 btc + sol + 常驻 guard 三个 Python 进程，直接进 OOM/回收循环，load 冲到 41，连 sshd 都 fork 不出来，SSH 完全失联（两次）。升到 2 GiB 后同样配置稳定在 1.2 GB 占用。
