@@ -208,7 +208,82 @@ sudo systemctl disable --now tradingbot-dashboard && sudo rm /etc/systemd/system
 **要公网网址？** 不要改 `--host`（代码会拒绝）。必须在前面加带 HTTPS 和登录认证的反向代理（例如 Caddy + 域名 + basic auth / OAuth），并且只在防火墙里开 443；在那之前，SSH 隧道是唯一的访问方式。
 
 
-## 12. USDC 组合闸门（`portfolio_guard.py --asset USDC`）
+## 12. USDC 篮子：一个进程跑 9 个币（`tradingbot-usdc.service`）
+
+在同一个 Demo 账户上用 USDC 做保证金，跑 BTC SOL ETH XRP LTC BCH ADA LINK BNB 的 `/USDC` 永续，每笔风险 3%，和 USDT 的两个机器人平行前向测试。USDT 那边（`tradingbot-btc/sol`、`config.portfolio.yaml`、`data/portfolio.db`、`data/HALT`）一律不动。配置是 `config.usdc-basket.example.yaml`，账本 `data/usdc_basket.db`，停机标志 `data/HALT_USDC`。
+
+**为什么一个进程**：一个机器人进程约 340 MB，大头是 ccxt 的市场表（`load_markets`），9 个币各开一个进程放不下。`main.py testnet-multi` 让 9 个币共用一个行情连接和一个下单连接；每个币仍然有自己的 Trader、风控、存档（run 名带币种）、对账和软止损，一个币出错只影响它自己，下一轮（30 秒后）先对账再重试。本机用假交易所实测：9 个币比 1 个币只多约 3 MB（RSS 125 → 128 MB，跑 120 根 K 线后），所以服务器上预计和单币进程差不多，约 345~360 MB。日志每行带币种，例如 `[SOL/USDC]`。
+
+### 启动之前（缺一不可）
+
+1. **USDC 的 portfolio_guard 已经部署**（第 13 节）。没有它，USDC 篮子没有 20% 组合停机线；而且旧 guard 触发时会平掉账户里**所有**仓位，USDC 的也会被平。
+2. Demo 账户是**单资产模式**（不是联合保证金 / Multi-Assets）：联合保证金不支持逐仓，USDT 和 USDC 的盈亏也会互相影响。
+3. `free -m` 的 available 至少约 450 MB（现在约 470 MB）。
+
+### 安装（admin 执行一次）
+
+```bash
+sudo -u tradingbot git -C /opt/tradingbot pull --ff-only
+# 配置复制一份再用：config.*.yaml 不进 git，以后改它不会挡住 pull
+sudo -u tradingbot cp /opt/tradingbot/config.usdc-basket.example.yaml /opt/tradingbot/config.usdc-basket.yaml
+sudo cp /opt/tradingbot/deploy/systemd/tradingbot-usdc.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable tradingbot-usdc.service      # 开机自启；先不启动，由 Claude 挑不在收盘的时间启动
+
+# 让 claude-ops 能启停这一个服务（和 btc / sol 那几条同样的写法）
+sudo tee /etc/sudoers.d/claude-ops-usdc >/dev/null <<'RULES'
+claude-ops ALL=(root) NOPASSWD: /usr/bin/systemctl start tradingbot-usdc.service, /usr/bin/systemctl stop tradingbot-usdc.service, /usr/bin/systemctl restart tradingbot-usdc.service
+RULES
+sudo chmod 440 /etc/sudoers.d/claude-ops-usdc
+sudo visudo -cf /etc/sudoers.d/claude-ops-usdc       # 必须输出 parsed OK
+```
+
+看 USDC 账本要用 `tools/forward_status.py --db data/usdc_basket.db`：如果 claude-ops 现有的 forward_status 规则限定了参数，照它的写法再加一条带 `--db data/usdc_basket.db` 的；没限定参数就不用加。
+
+### 启动（Claude 做，避开 4h 收盘：北京时间 00/04/08/12/16/20 点）
+
+```bash
+sudo -n systemctl start tradingbot-usdc.service
+tail -n 80 /var/log/tradingbot-usdc.log
+```
+
+正常的样子：先一行 `账户 USDC 权益 …，每个币按 … 定仓位`，然后 9 个币各有 `[X/USDC] 启动`、`已加载 301 根 K 线`、`K 线收盘 …`。
+
+- 出现 `交易账户读不到 USDC 余额`：进程会直接退出（systemd 30 秒后重启，还是会退出），先 `stop` 掉。先去 Demo 网页确认 USDC 在 U 本位合约账户里；如果在，可能是 ccxt 跳过了 `updateTime=0`（从没动过）的资产，这时停下来商量，不要改代码绕过这个检查。
+- 某个币一直报 `初始化失败，下一轮重试`：其他币照常跑；看是网络问题还是这个币在 Demo 上有问题。
+- 配置里写错币名（`BadSymbol`）：启动时直接退出。
+
+### 内存：部署后实测，再定 MemoryMax
+
+unit 里先给 `MemoryMax=600M`、`OOMScoreAdjust=500`（内存不够时内核先杀这个服务，不杀 USDT 的两个机器人）。跑满一根 K 线后看：
+
+```bash
+cat /sys/fs/cgroup/system.slice/tradingbot-usdc.service/memory.peak   # 启动以来峰值（含页缓存）
+cat /sys/fs/cgroup/system.slice/tradingbot-btc.service/memory.peak    # 对照：单币进程
+ps -o pid,rss,cmd -u tradingbot
+free -m
+```
+
+峰值稳定之后，把 `MemoryMax` 改成「峰值 + 约 100M」（admin 改 unit + `daemon-reload`，Claude 挑不在收盘的时间重启）。不要低于峰值：单币进程用过 `MemoryMax=450M`，启动加载市场表时反复被回收 / 重启（HANDOVER“踩过的坑”第 2 条）。
+
+### 请求频率
+
+Binance U 本位按 IP 每分钟 2400 权重；行情走正式站（公开接口），下单走 Demo（签名接口），两边分开算。9 个币在一个线程里依次处理，ccxt 自带的限速会把请求错开，不需要另外错峰。
+
+| 时候 | 正式站（行情） | Demo（下单） |
+| --- | --- | --- |
+| 平时每轮（每 30 秒） | 9 次 ticker × 1 = 9（每分钟 18） | 0（只有触发软止损时才有） |
+| K 线收盘那一轮 | 每个币 3 次 ticker + 1 次 K 线（5）= 8，共 72 | 每个币读持仓 5 + 余额 5 = 10，共 90；9 个币同时反手最多约 290 |
+| 启动 | 市场表 + 每个币约 9，共约 85 | 每个币约 58（持仓模式 30、逐仓 / 杠杆 / 单向各 1、持仓 5 × 3、余额 5 × 2），共约 530；有开仓再加，最多约 820 |
+
+下单本身不算 IP 权重，只算订单数（每 10 秒 300 单），一轮最多 18 单。USDT 的两个机器人平时每分钟只有约 4 权重。所以 K 线收盘那一分钟 Demo 最多用到上限的约 12%，正式站约 4%；启动那一分钟 Demo 约 22%~34%。就算进程反复崩溃重启（每 30 秒一次），每分钟也在 1000 以内。
+
+### 停止开新仓 / 恢复
+
+和 USDT 一样，只是文件换成 `data/HALT_USDC`：建这个文件就不再开新仓，平仓和止损照常；删掉恢复。`data/HALT`（USDT 的）对 USDC 篮子不起作用，反过来也一样。
+
+
+## 13. USDC 组合闸门（`portfolio_guard.py --asset USDC`）
 
 同一个 Binance Demo 合约账户里，USDT 机器人（BTC + SOL）和 USDC 机器人（9 币篮子）各有一个闸门，按保证金资产分开，互不影响：
 

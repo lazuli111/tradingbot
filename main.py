@@ -4,6 +4,7 @@
     python main.py walkforward --since 2025-01-01 [--train-days 180 --test-days 60]
     python main.py paper    [--market perp]
     python main.py testnet  [--market perp]      # needs testnet keys in .env
+    python main.py testnet-multi --config config.usdc-basket.yaml [--symbols BTC/USDC,SOL/USDC]
 """
 from __future__ import annotations
 
@@ -51,7 +52,20 @@ def build_parser() -> argparse.ArgumentParser:
                             ("testnet", "连接交易所测试网 / 模拟交易账户下单")):
         p = sub.add_parser(name, parents=[common], help=help_text)
         p.add_argument("--max-bars", type=int, help="处理多少根新 K 线后退出（默认一直运行）")
+
+    multi = sub.add_parser("testnet-multi", parents=[common],
+                           help="一个进程跑多个币（测试网），行情和下单各共用一个交易所连接")
+    multi.add_argument("--symbols", type=parse_symbols,
+                       help="逗号分隔，如 BTC/USDC,SOL/USDC（默认用配置里的 symbols）")
+    multi.add_argument("--max-bars", type=int, help="处理多少根新 K 线后退出（默认一直运行）")
     return parser
+
+
+def parse_symbols(text: str) -> list[str]:
+    symbols = [s.strip() for s in text.split(",") if s.strip()]
+    if not symbols:
+        raise argparse.ArgumentTypeError("--symbols 不能为空")
+    return symbols
 
 
 def parse_grid(text: str) -> dict[str, list]:
@@ -113,10 +127,15 @@ def cmd_backtest(cfg, args) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    multi = args.command == "testnet-multi"
+    if multi:
+        from bot.engine.live_multi import LOG_FORMAT, install_symbol_tag
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    overrides = {k: getattr(args, k) for k in
-                 ("exchange", "market", "symbol", "timeframe", "strategy_name", "leverage")}
+                        format=LOG_FORMAT if multi else "%(asctime)s %(levelname)s %(name)s: %(message)s")
+    if multi:
+        install_symbol_tag()  # all the coins log into one file: tag each line with its coin
+    overrides = {k: getattr(args, k, None) for k in
+                 ("exchange", "market", "symbol", "symbols", "timeframe", "strategy_name", "leverage")}
     try:
         cfg = load_config(args.config, overrides)
     except ValueError as e:
@@ -131,6 +150,13 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as e:
             print(f"错误: {e}", file=sys.stderr)
             return 2
+    elif multi:
+        from bot.engine.live_multi import MultiRunner
+
+        if not cfg.symbols:
+            print("配置错误: testnet-multi 需要币种列表：配置里写 symbols，或用 --symbols", file=sys.stderr)
+            return 2
+        MultiRunner(cfg, "testnet").run(max_bars=args.max_bars)
     else:
         from bot.engine.live import LiveRunner
 

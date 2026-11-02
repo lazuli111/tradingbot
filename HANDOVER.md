@@ -267,7 +267,7 @@ OKX 同样参数、2023-01 起窗口的对照（资金费只覆盖最近约 3 �
 1. **每个品种一个进程**，`--symbol` 区分，各自独立持仓、独立账本、独立崩溃恢复。
 2. **权益按份数缩放**：`live.equity_fraction = 0.5` 让每个进程只按「账户权益 × 50%」算仓位，两个加起来敞口不超过 100%，不会互相抢保证金。缩放只影响下单量，交易和统计仍是真实的。
 3. **组合级熔断**：单币的永久熔断关掉（`max_drawdown: 0.99`），改由 `tools/portfolio_guard.py` 盯**账户总权益**：从峰值回撤 20% 就先写停机标志 `data/HALT`、再市价清掉所有仓位、写 `halted` 并停机，人工 `--resume` 才能恢复。两个机器人开新仓前都检查 `data/HALT`，所以停机期间信号再翻转也不会开仓（2026-10-26 起；之前不检查，见 LIVE_PLAN C8）。这样不会因为某个品种回撤 20% 就永久废掉它。
-   - 按保证金资产分开（`--asset`，默认 USDT）：这个闸门只读 USDT 余额，只平 USDT 保证金的仓位（symbol 以 `:USDT` 结尾）。同一账户里的 USDC 机器人另有一个闸门 `--asset USDC`，状态 `data/portfolio_guard_usdc.json`、停机标志 `data/HALT_USDC`，两边触发、停机、`--resume` 互不影响。安装和运维见 `DEPLOY.md` 第 12 节。
+   - 按保证金资产分开（`--asset`，默认 USDT）：这个闸门只读 USDT 余额，只平 USDT 保证金的仓位（symbol 以 `:USDT` 结尾）。同一账户里的 USDC 机器人另有一个闸门 `--asset USDC`，状态 `data/portfolio_guard_usdc.json`、停机标志 `data/HALT_USDC`，两边触发、停机、`--resume` 互不影响。安装和运维见 `DEPLOY.md` 第 13 节。
 
 ```powershell
 # 组合总览（账户权益、峰值、回撤、持仓）
@@ -334,6 +334,8 @@ New-Item logs\forward_bot.stop
   cd /opt/tradingbot && sudo -u tradingbot .venv/bin/python tools/portfolio_guard.py --status
   sudo tail -f /var/log/tradingbot-btc.log
   ```
+
+**USDC 篮子（2026-11-02 写好，未部署）**：同一个 Demo 账户上用 USDC 跑 9 个币、每笔风险 3%，一个进程跑完（`main.py testnet-multi`，`tradingbot-usdc.service`，日志 `/var/log/tradingbot-usdc.log`，账本 `data/usdc_basket.db`，停机标志 `data/HALT_USDC`）。USDT 的两个服务不受影响。前提、安装、内存和请求频率见 `DEPLOY.md` 第 12 节。
 
 **踩过的坑（都付出过停机代价）**：
 

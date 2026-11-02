@@ -35,6 +35,9 @@ Copy-Item config.example.yaml config.yaml
 
 # 测试网：先在 .env 填入测试网 / Demo Trading 的 API Key
 .venv/bin/python main.py testnet --market perp
+
+# 测试网，一个进程跑一篮币（配置里的 symbols，每个币按 live.equity_fraction 分权益）
+.venv/bin/python main.py testnet-multi --config config.usdc-basket.yaml
 ```
 
 服务器上的实时情况可以用只读看板查看：`ssh -N -L 8765:127.0.0.1:8765 admin@<服务器IP>`，然后打开 http://127.0.0.1:8765 。安装和使用说明见 `DEPLOY.md` 第 11 节。
