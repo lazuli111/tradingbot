@@ -1,0 +1,17 @@
+[Unit]
+Description=Trading bot portfolio guard, USDC margin - one pass (flatten + halt on drawdown from peak)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=tradingbot
+WorkingDirectory=/opt/tradingbot
+Environment=PYTHONIOENCODING=utf-8
+Environment=OPENBLAS_NUM_THREADS=1
+# 照抄 tradingbot-guard.service，只多了 --asset USDC：只管 USDC 保证金的仓位，
+# 状态 data/portfolio_guard_usdc.json，停机标志 data/HALT_USDC（USDC 机器人的 live.halt_file 同名）
+# --max-dd 0.20：用户待定，部署时确认
+ExecStart=/opt/tradingbot/.venv/bin/python tools/portfolio_guard.py --once --asset USDC --max-dd 0.20
+MemoryMax=300M
+StandardOutput=append:/var/log/tradingbot-guard-usdc.log
+StandardError=append:/var/log/tradingbot-guard-usdc.log
