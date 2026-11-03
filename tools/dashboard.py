@@ -39,8 +39,12 @@ GUARD_RE = re.compile(
     r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\s+权益 (-?[\d.]+)\s+峰值 (-?[\d.]+)\s+回撤 ([+-]?[\d.]+)%"
     r"\s+持仓 (\d+)\s+免费 (-?[\d.]+)(\s+\[已停机\])?")
 GUARD_EVENT_RE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\s+(.+)$")
-LOG_RE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),\d+ (\w+) ([\w.]+): (.*)$")
+# 多币进程（main.py testnet-multi）的日志在模块名后多一个币种标签，如 "bot.engine.live [BTC/USDT]: ..."
+LOG_RE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),\d+ (\w+) ([\w.]+)(?: \[([^\]]*)\])?: (.*)$")
 BAR_RE = re.compile(r"^K 线收盘 (\d{4}-\d\d-\d\d \d\d:\d\d) close=(-?[\d.]+) 信号=([+-]?\d+) 权益=(-?[\d.]+)")
+
+
+USDT_BOT = ("tradingbot-usdt.service", Path("/var/log/tradingbot-usdt.log"))
 
 
 @dataclass
@@ -49,10 +53,12 @@ class Config:
     db: str = "data/portfolio.db"
     guard_state: str = "data/portfolio_guard.json"
     guard_log: Path = Path("/var/log/tradingbot-guard.log")
-    # 品种 -> (systemd 服务, 日志)
+    # 品种 -> (systemd 服务, 日志)，或几个这样的候选：在跑的那个算数，都没在跑就按第一个报警。
+    # BTC、SOL 由一个进程跑（tradingbot-usdt.service，共用一个日志，每行带 [BTC/USDT] 这样的标签）；
+    # 后面的单币服务是它取代的旧形态，留着是为了切换前后、回滚时看板都不用改。
     bots: dict = field(default_factory=lambda: {
-        "BTC": ("tradingbot-btc.service", Path("/var/log/tradingbot-btc.log")),
-        "SOL": ("tradingbot-sol.service", Path("/var/log/tradingbot-sol.log")),
+        "BTC": [USDT_BOT, ("tradingbot-btc.service", Path("/var/log/tradingbot-btc.log"))],
+        "SOL": [USDT_BOT, ("tradingbot-sol.service", Path("/var/log/tradingbot-sol.log"))],
     })
     guard_service: str = "tradingbot-guard.service"
     guard_timer: str = "tradingbot-guard.timer"
@@ -138,8 +144,11 @@ def parse_guard_log(lines: list[str]) -> dict:
     return {"points": points, "events": events}
 
 
-def parse_bot_log(lines: list[str], tz: tzinfo | None) -> dict:
-    """机器人日志：最后一次 K 线处理、最后一次启动、ERROR（带异常末行）和对账类 WARNING。"""
+def parse_bot_log(lines: list[str], tz: tzinfo | None, coin: str | None = None) -> dict:
+    """机器人日志：最后一次 K 线处理、最后一次启动、ERROR（带异常末行）和对账类 WARNING。
+
+    几个币共用一个日志时（每行带 [BTC/USDT] 这样的标签）给 coin（如 "BTC"）：只看这个币的行，
+    进程级的 [-] 行（启动、进程出错）算每个币都有。不带标签的单币日志全部都算。"""
     last_bar = last_start = None
     errors, warnings = [], []
     current_error = None
@@ -151,8 +160,11 @@ def parse_bot_log(lines: list[str], tz: tzinfo | None) -> dict:
                 current_error["detail"] = line.strip()[:300]
             continue
         current_error = None
+        tag = m[4]
+        if coin and tag not in (None, "-") and tag.split("/")[0] != coin:
+            continue  # 别的币的行；它的 traceback 续行也跟着跳过（current_error 已清空）
         ts = _ms(m[1], "%Y-%m-%d %H:%M:%S", tz)
-        level, msg = m[2], m[4]
+        level, msg = m[2], m[5]
         if level in ("ERROR", "CRITICAL"):
             current_error = {"ts": ts, "level": level, "text": msg[:300], "detail": None}
             errors.append(current_error)
@@ -270,18 +282,36 @@ def build_snapshot(cfg: Config, now_ms: int | None = None, show=systemctl_show, 
     bots = []
     systemd_errors: list[str] = []
     positions_open = 0
-    for name, (unit, log_path) in cfg.bots.items():
+    services: dict[str, dict] = {}       # 几个币共用一个服务 / 日志时只查、只读一次
+    logs: dict[Path, list[str]] = {}
+    down: dict[str, list[str]] = {}      # 没在跑的服务 -> 靠它的币
+
+    def service(unit: str) -> dict:
+        if unit not in services:
+            svc = _service(show, unit, ["ActiveState", "SubState", "ActiveEnterTimestamp", "NRestarts"])
+            if "error" in svc:
+                systemd_errors.append(svc["error"])
+                svc = {**cgroup(unit), "error": svc["error"]}
+            services[unit] = svc
+        return services[unit]
+
+    for name, where in cfg.bots.items():
+        candidates = [where] if isinstance(where, tuple) else list(where)
+        running = [c for c in candidates if service(c[0]).get("ActiveState") == "active"]
+        unit, log_path = (running or candidates)[0]
+        if len(running) > 1:
+            alert("critical", f"{name} 同时有 {len(running)} 个服务在跑（{'、'.join(u for u, _ in running)}），"
+                              f"会重复下单：停掉多余的")
         run = run_by_base.get(name)
         info = db["runs"].get(run, {"equity": [], "state": None})
         symbol = run_symbol(run) if run else f"{name}/USDT:USDT"
         trader = (info["state"] or {}).get("trader", {})
         broker = trader.get("broker", {})
         pos = broker.get("position")
-        svc = _service(show, unit, ["ActiveState", "SubState", "ActiveEnterTimestamp", "NRestarts"])
-        if "error" in svc:
-            systemd_errors.append(svc["error"])
-            svc = {**cgroup(unit), "error": svc["error"]}
-        log = parse_bot_log(tail_lines(log_path, cfg.log_tail_bytes), cfg.log_tz)
+        svc = service(unit)
+        if log_path not in logs:
+            logs[log_path] = tail_lines(log_path, cfg.log_tail_bytes)
+        log = parse_bot_log(logs[log_path], cfg.log_tz, name)
 
         position = None
         if pos:
@@ -305,7 +335,7 @@ def build_snapshot(cfg: Config, now_ms: int | None = None, show=systemctl_show, 
             last_bar = None  # 日志被截断或对不上，不拿它当最近一根
         recent = now_ms - 24 * HOUR_MS
         bot = {
-            "name": name, "run": run, "symbol": symbol, "service": svc, "position": position,
+            "name": name, "run": run, "symbol": symbol, "unit": unit, "service": svc, "position": position,
             "last_signal": trader.get("last_signal"),
             "unresolved": broker.get("unresolved"),
             "risk": trader.get("risk"),
@@ -323,7 +353,7 @@ def build_snapshot(cfg: Config, now_ms: int | None = None, show=systemctl_show, 
         bots.append(bot)
 
         if svc.get("ActiveState") != "active":
-            alert("critical", f"{name} 服务未运行（{svc.get('ActiveState') or '未知'}）")
+            down.setdefault(unit, []).append(name)
         if run is None:
             alert("serious", f"{name} 在账本里没有记录")
         elif overdue:
@@ -337,6 +367,9 @@ def build_snapshot(cfg: Config, now_ms: int | None = None, show=systemctl_show, 
             alert("warning", f"{name} 最近 24 小时有 {bot['errors_24h']} 条 ERROR")
         if bot["warnings_24h"]:
             alert("warning", f"{name} 最近 24 小时有 {bot['warnings_24h']} 条对账类警告")
+
+    for unit, names in down.items():  # 一个进程停了只报一条，列出靠它的币
+        alert("critical", f"{'、'.join(names)} 服务未运行（{services[unit].get('ActiveState') or '未知'}）")
 
     # 账户（guard）
     guard_log = parse_guard_log(tail_lines(cfg.guard_log, 64 * 1024 * 1024))

@@ -325,7 +325,7 @@ New-Item logs\forward_bot.stop
 
 - **机器**：阿里云轻量应用服务器，日本（东京），2 vCPU / 2 GiB，Ubuntu 24.04
 - **形态**：systemd + venv，不装 Docker；两个品种各一个服务，外加一个 5 分钟定时闸门
-- **服务**：`tradingbot-btc.service`、`tradingbot-sol.service`、`tradingbot-guard.timer`（oneshot + timer）
+- **服务**：`tradingbot-btc.service`、`tradingbot-sol.service`、`tradingbot-guard.timer`（oneshot + timer）。2026-11-02 起改为 BTC + SOL 一个进程 `tradingbot-usdt.service`（日志 `/var/log/tradingbot-usdt.log`；策略、参数、账本、run 名、停机标志都不变），btc / sol 两个 unit 已被它取代、只留着回滚。切换、回滚和内存预算见 `DEPLOY.md` 第 14 节
 - **实测**：单进程 RSS ≈ 356 MB，两品种 + 系统约 1.2 GB 占用，1 GB swap 兜底，load ≈ 0.2
 - **运维命令**（服务器上）：
   ```bash
@@ -335,7 +335,7 @@ New-Item logs\forward_bot.stop
   sudo tail -f /var/log/tradingbot-btc.log
   ```
 
-**USDC 篮子（2026-11-02 写好，未部署）**：同一个 Demo 账户上用 USDC 跑 9 个币、每笔风险 3%，一个进程跑完（`main.py testnet-multi`，`tradingbot-usdc.service`，日志 `/var/log/tradingbot-usdc.log`，账本 `data/usdc_basket.db`，停机标志 `data/HALT_USDC`）。USDT 的两个服务不受影响。前提、安装、内存和请求频率见 `DEPLOY.md` 第 12 节。
+**USDC 篮子（2026-11-02 写好；当晚启动后内存不够卡死过一次，已停、已取消自启）**：同一个 Demo 账户上用 USDC 跑 9 个币、每笔风险 3%，一个进程跑完（`main.py testnet-multi`，`tradingbot-usdc.service`，日志 `/var/log/tradingbot-usdc.log`，账本 `data/usdc_basket.db`，停机标志 `data/HALT_USDC`）。USDT 机器人不受影响。前提、安装和请求频率见 `DEPLOY.md` 第 12 节；要先把 USDT 合成一个进程（第 14 节），内存以第 14 节的预算为准。
 
 **踩过的坑（都付出过停机代价）**：
 
@@ -343,6 +343,7 @@ New-Item logs\forward_bot.stop
 2. **`MemoryMax` 会害人**。给进程设 `MemoryMax=450M` 后，加载行情时的内存页反复触发回收/重启，反而更容易把机器拖死；换成 `MemoryHigh`（只施压不杀）才对。
 3. **闸门用 timer 不用常驻**。`portfolio_guard.py` 原本是 `--loop 60` 常驻，多背一个约 150 MB 的进程；改成 oneshot + timer 每 5 分钟一次，还顺手让它不 import pandas（少 ~120 MB）。
 4. **别把 `.env` 打包进构建产物**。有一次误把含 Key 的部署包 commit 了，虽然立刻 `git rm` + `--force-with-lease` 重写掉，但保险起见还是应该轮换 Demo Key。
+5. **内存预算要把 guard 的峰值算进去**（2026-11-02，北京时间）。21:25 启动 USDC 篮子后 `free -m` 的 available 只剩约 128 MB（btc、sol 各约 365 MB，USDC 约 380 MB，系统 + 看板约 330 MB，总共 1613 MB）；21:27:12 USDC 的 guard（oneshot，约 150 MB）一跑就把内存挤爆，整机卡死，只能强制重启。USDC 机器人随后停掉、取消开机自启。办法是把 USDT 的两个进程合成一个（`tradingbot-usdt.service`，省约 340 MB），内存预算表见 `DEPLOY.md` 第 14 节。
 
 ### 事故记录：本地持仓与交易所不一致（2026-10-22，BTC）
 

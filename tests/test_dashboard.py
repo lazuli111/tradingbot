@@ -313,6 +313,142 @@ def test_missing_files_do_not_crash(tmp_path):
     assert any("guard 日志里没有权益记录" in t for _, t in found)
 
 
+# ---- 一个进程跑 BTC + SOL（tradingbot-usdt.service） ----------------------------
+
+def tagged_line(ms, level, name, tag, msg):
+    """main.py testnet-multi 的日志格式：模块名后带币种标签，进程级的行是 [-]。"""
+    return f"{utc(ms)},123 {level} {name} [{tag}]: {msg}"
+
+
+def bar_msg(close, signal, equity):
+    return f"K 线收盘 {utc(BAR0, '%Y-%m-%d %H:%M')} close={close} 信号={signal} 权益={equity} 持仓=无"
+
+
+@pytest.fixture
+def shared(env):
+    """切换之后：BTC、SOL 共用 tradingbot-usdt.service 和一个日志，旧的单币服务已停。"""
+    (env.logs / "usdt.log").write_text("\n".join([
+        tagged_line(BAR0 - H, "INFO", "bot.engine.live_multi", "-",
+                    "启动 testnet 模式（一个进程 2 个币）: binance BTC/USDT,SOL/USDT 4h"),
+        tagged_line(BAR0 - H, "WARNING", "bot.broker.ccxt_broker", "BTC/USDT", "set_margin_mode 失败（可能已设置）: -4046"),
+        tagged_line(BAR0 - H + 1000, "INFO", "bot.engine.live_multi", "SOL/USDT", "启动: SOL/USDT:USDT 4h 策略 ma_cross"),
+        tagged_line(BAR0 - 30 * 60_000, "ERROR", "bot.engine.live", "SOL/USDT", "本轮处理出错：下一轮先与交易所核对持仓，再重试"),
+        "Traceback (most recent call last):",
+        '  File "x.py", line 1, in <module>',
+        "ccxt.base.errors.NetworkError: binance GET https://demo-fapi.binance.com/fapi/v2/positionRisk timeout",
+        tagged_line(BAR0 - 20 * 60_000, "WARNING", "bot.broker.ccxt_broker", "BTC/USDT",
+                    "本地持仓与交易所不一致，以交易所为准：本地 +1 0.0035，交易所 无"),
+        tagged_line(BAR0 + 4 * H + 3000, "INFO", "bot.engine.live", "BTC/USDT", bar_msg("82887.40", "+1", "578.00")),
+        tagged_line(BAR0 + 4 * H + 4000, "INFO", "bot.engine.live", "SOL/USDT", bar_msg("105.47", "+1", "575.85")),
+    ]) + "\n")
+    usdt = ("tradingbot-usdt.service", env.logs / "usdt.log")
+    env.cfg.bots = {"BTC": [usdt, ("tradingbot-btc.service", env.logs / "btc.log")],
+                    "SOL": [usdt, ("tradingbot-sol.service", env.logs / "sol.log")]}
+    env.services["tradingbot-usdt.service"] = {"ActiveState": "active", "SubState": "running",
+                                               "ActiveEnterTimestamp": f"@{(BAR0 - H) // 1000}", "NRestarts": "0"}
+    for old in ("tradingbot-btc.service", "tradingbot-sol.service"):
+        env.services[old] = {"ActiveState": "inactive", "SubState": "dead"}
+    env.cgroup_states = {"tradingbot-usdt.service": "active"}
+    return env
+
+
+def test_default_config_reads_the_usdt_unit_and_its_log():
+    unit = (Path(__file__).resolve().parents[1] / "deploy/systemd/tradingbot-usdt.service").read_text(encoding="utf-8")
+    cfg = dash.Config()
+    for name, old in (("BTC", "btc"), ("SOL", "sol")):
+        assert cfg.bots[name] == [("tradingbot-usdt.service", Path("/var/log/tradingbot-usdt.log")),
+                                  (f"tradingbot-{old}.service", Path(f"/var/log/tradingbot-{old}.log"))]
+    assert "StandardOutput=append:/var/log/tradingbot-usdt.log" in unit
+    assert cfg.db == "data/portfolio.db"  # run 名没变，账本也没变：看板照旧按 run 名找两个币
+
+
+def test_shared_log_lines_are_split_by_coin_tag(shared):
+    lines = dash.tail_lines(shared.logs / "usdt.log", 1 << 20)
+    btc = dash.parse_bot_log(lines, timezone.utc, "BTC")
+    sol = dash.parse_bot_log(lines, timezone.utc, "SOL")
+    assert btc["last_bar"]["close"] == 82887.40 and sol["last_bar"]["close"] == 105.47
+    assert btc["errors"] == []
+    [err] = sol["errors"]
+    assert err["text"].startswith("本轮处理出错") and "positionRisk timeout" in err["detail"]
+    assert [w["text"][:9] for w in btc["warnings"]] == ["本地持仓与交易所不"] and sol["warnings"] == []
+    assert btc["last_start"] == sol["last_start"] == BAR0 - H  # 进程级 [-] 的启动算两个币都有
+    # 不给 coin 就全算（单币日志的老用法），一行 ERROR 的 traceback 不会挂到别的币头上
+    whole = dash.parse_bot_log(lines, timezone.utc)
+    assert len(whole["errors"]) == 1 and len(whole["warnings"]) == 1
+
+
+def test_process_level_error_counts_for_every_coin(shared):
+    with open(shared.logs / "usdt.log", "a", encoding="utf-8") as f:
+        f.write(tagged_line(BAR0 + 4 * H + 9000, "ERROR", "bot.engine.live_multi", "-", "保存状态失败") + "\n")
+        f.write("sqlite3.OperationalError: database is locked\n")
+    lines = dash.tail_lines(shared.logs / "usdt.log", 1 << 20)
+    btc = dash.parse_bot_log(lines, timezone.utc, "BTC")
+    assert [e["detail"] for e in btc["errors"]] == ["sqlite3.OperationalError: database is locked"]
+    assert len(dash.parse_bot_log(lines, timezone.utc, "SOL")["errors"]) == 2
+
+
+def test_snapshot_with_one_service_for_both_coins(shared):
+    calls = []
+
+    def show(unit, props):
+        calls.append(unit)
+        return shared.show(unit, props)
+
+    snap = shared.snapshot(show=show)
+    btc, sol = snap["bots"]
+    assert btc["unit"] == sol["unit"] == "tradingbot-usdt.service"
+    assert btc["service"]["ActiveState"] == sol["service"]["ActiveState"] == "active"
+    assert calls.count("tradingbot-usdt.service") == 1  # 共用的服务只查一次
+    assert btc["last_bar"]["close"] == 82887.40 and sol["last_bar"]["close"] == 105.47
+    assert btc["last_bar"]["processed_at"] == BAR0 + 4 * H + 3000
+    assert (btc["errors_24h"], btc["warnings_24h"], sol["errors_24h"], sol["warnings_24h"]) == (0, 1, 1, 0)
+    assert sol["position"]["stop"] == 104.62  # 持仓、止损照旧从账本读
+    found = levels(snap)
+    assert {lvl for lvl, _ in found} == {"warning"}
+    assert ("warning", "SOL 最近 24 小时有 1 条 ERROR") in found
+    assert ("warning", "BTC 最近 24 小时有 1 条对账类警告") in found
+
+
+def test_shared_service_down_is_one_alert_and_other_rules_still_fire(shared):
+    shared.services["tradingbot-usdt.service"]["ActiveState"] = "failed"
+    snap = shared.snapshot(now=BAR0 + 8 * H + 31 * 60_000)  # 也早该处理下一根了
+    found = levels(snap)
+    assert [t for lvl, t in found if "服务未运行" in t] == ["BTC、SOL 服务未运行（failed）"]
+    assert found[0] == ("critical", "BTC、SOL 服务未运行（failed）")
+    assert all(b["unit"] == "tradingbot-usdt.service" for b in snap["bots"])  # 都没在跑：按第一个候选报
+    assert sum(lvl == "serious" and "没有处理新 K 线" in t for lvl, t in found) == 2
+
+
+def test_shared_service_through_cgroup_when_systemd_is_unreadable(shared):
+    def broken(unit, props):
+        raise RuntimeError("systemctl show 退出码 1: Failed to connect to bus")
+
+    snap = shared.snapshot(show=broken)
+    assert all(b["service"]["source"] == "cgroup" and b["service"]["ActiveState"] == "active" for b in snap["bots"])
+    assert not any("服务未运行" in t for _, t in levels(snap))
+    shared.cgroup_states = {}
+    assert ("critical", "BTC、SOL 服务未运行（inactive）") in levels(shared.snapshot(show=broken))
+
+
+def test_before_the_switch_and_after_a_rollback_the_single_coin_services_count(shared):
+    shared.services["tradingbot-usdt.service"] = {"ActiveState": "inactive", "SubState": "dead"}
+    for old in ("tradingbot-btc.service", "tradingbot-sol.service"):
+        shared.services[old] = {"ActiveState": "active", "SubState": "running"}
+    snap = shared.snapshot()
+    btc, sol = snap["bots"]
+    assert (btc["unit"], sol["unit"]) == ("tradingbot-btc.service", "tradingbot-sol.service")
+    assert btc["errors"][0]["detail"].endswith("ReduceOnly Order is rejected.\"}")  # btc.log，不是 usdt.log
+    assert not any("服务未运行" in t for _, t in levels(snap))
+
+
+def test_two_services_trading_one_coin_is_critical(shared):
+    shared.services["tradingbot-btc.service"]["ActiveState"] = "active"  # 忘了停旧的
+    found = levels(shared.snapshot())
+    assert found[0] == ("critical", "BTC 同时有 2 个服务在跑（tradingbot-usdt.service、tradingbot-btc.service），"
+                                    "会重复下单：停掉多余的")
+    assert not any(t.startswith("SOL 同时") for _, t in found)
+
+
 # ---- 只读 -----------------------------------------------------------------
 
 def files_of(data, skip=()):

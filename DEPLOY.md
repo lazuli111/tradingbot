@@ -89,6 +89,8 @@ journalctl -u tradingbot-btc -f
 > **1 GB 实例的实际情况（实测）**：一个机器人进程 RSS ≈ **340 MB**，加上系统和阿里云的 aegis 监控，1 GB 机器只剩不到 200 MB 余量。
 > 所以：**只开一个品种**，闸门用 `tradingbot-guard.timer`（每 5 分钟跑一次 `--once` 就退出），不要开 `tradingbot-guard.service` 的常驻模式，也不要同时开 `tradingbot-sol`。
 > 想跑两个品种，先把实例升到 2 GB。unit 里已经写了 `MemoryMax` 和 `OPENBLAS_NUM_THREADS=1`，超限只会重启那个服务，不会拖垮整机。
+>
+> **东京服务器现在的形态**：BTC + SOL 由一个进程 `tradingbot-usdt.service` 跑（第 14 节），`tradingbot-btc` / `tradingbot-sol` 两个 unit 已被它取代，留在仓库里只为回滚。
 
 ## 6. 上线当天验证（10 分钟）
 
@@ -156,7 +158,7 @@ docker compose exec guard python tools/portfolio_guard.py --status   # 账户权
 - systemd 用 `DynamicUser=yes` 的临时用户运行，整个文件系统只读，`.env` / `.git` 不可见；不需要也读不到 API Key。浮动盈亏用 Binance Demo 的公开标记价接口计算。
 - 只认 `localhost` / `127.0.0.1` 的 Host 头（防 DNS rebinding；本地端口不限，隧道可以用别的本地端口），带 CSP、`X-Frame-Options: DENY`，页面不加载任何外部资源。
 
-**数据来源**：账本 `data/portfolio.db`（持仓、止损、K 线、成交）、`data/portfolio_guard.json`（峰值、停机状态）、`/var/log/tradingbot-guard.log`（账户总权益，每 5 分钟一行）、`/var/log/tradingbot-{btc,sol}.log`（ERROR、对账警告、最后一次 K 线处理）、`systemctl show`（服务和 guard 定时器状态；在沙箱里读不到时，服务是否在跑改看 `/sys/fs/cgroup` 里该服务有没有进程，guard 只看日志是否按时更新，告警区会有一条“读不到 systemd 状态”的提示，原因写进 `journalctl -u tradingbot-dashboard`）。
+**数据来源**：账本 `data/portfolio.db`（持仓、止损、K 线、成交）、`data/portfolio_guard.json`（峰值、停机状态）、`/var/log/tradingbot-guard.log`（账户总权益，每 5 分钟一行）、`/var/log/tradingbot-usdt.log`（ERROR、对账警告、最后一次 K 线处理；BTC、SOL 共用一个日志，按每行的 `[BTC/USDT]` / `[SOL/USDT]` 标签分开，进程级的 `[-]` 行两个币都算。还在跑单币服务 `tradingbot-btc/sol` 时自动改读 `/var/log/tradingbot-{btc,sol}.log`，见第 14 节）、`systemctl show`（服务和 guard 定时器状态；在沙箱里读不到时，服务是否在跑改看 `/sys/fs/cgroup` 里该服务有没有进程，guard 只看日志是否按时更新，告警区会有一条“读不到 systemd 状态”的提示，原因写进 `journalctl -u tradingbot-dashboard`）。
 
 **流量**：首次打开约 9 KB（gzip），之后每分钟拉一次约 3 KB 的快照；页面一直开着一天约 4 MB。服务端快照缓存 30 秒，多开几个页面也只采集一次。
 
@@ -210,7 +212,7 @@ sudo systemctl disable --now tradingbot-dashboard && sudo rm /etc/systemd/system
 
 ## 12. USDC 篮子：一个进程跑 9 个币（`tradingbot-usdc.service`）
 
-在同一个 Demo 账户上用 USDC 做保证金，跑 BTC SOL ETH XRP LTC BCH ADA LINK BNB 的 `/USDC` 永续，每笔风险 3%，和 USDT 的两个机器人平行前向测试。USDT 那边（`tradingbot-btc/sol`、`config.portfolio.yaml`、`data/portfolio.db`、`data/HALT`）一律不动。配置是 `config.usdc-basket.example.yaml`，账本 `data/usdc_basket.db`，停机标志 `data/HALT_USDC`。
+在同一个 Demo 账户上用 USDC 做保证金，跑 BTC SOL ETH XRP LTC BCH ADA LINK BNB 的 `/USDC` 永续，每笔风险 3%，和 USDT 机器人（BTC + SOL）平行前向测试。USDT 那边（`tradingbot-usdt`（第 14 节）、`config.portfolio.yaml`、`data/portfolio.db`、`data/HALT`）一律不动。配置是 `config.usdc-basket.example.yaml`，账本 `data/usdc_basket.db`，停机标志 `data/HALT_USDC`。
 
 **为什么一个进程**：一个机器人进程约 340 MB，大头是 ccxt 的市场表（`load_markets`），9 个币各开一个进程放不下。`main.py testnet-multi` 让 9 个币共用一个行情连接和一个下单连接；每个币仍然有自己的 Trader、风控、存档（run 名带币种）、对账和软止损，一个币出错只影响它自己，下一轮（30 秒后）先对账再重试。本机用假交易所实测：9 个币比 1 个币只多约 3 MB（RSS 125 → 128 MB，跑 120 根 K 线后），所以服务器上预计和单币进程差不多，约 345~360 MB。日志每行带币种，例如 `[SOL/USDC]`。
 
@@ -218,7 +220,7 @@ sudo systemctl disable --now tradingbot-dashboard && sudo rm /etc/systemd/system
 
 1. **USDC 的 portfolio_guard 已经部署**（第 13 节）。没有它，USDC 篮子没有 20% 组合停机线；而且旧 guard 触发时会平掉账户里**所有**仓位，USDC 的也会被平。
 2. Demo 账户是**单资产模式**（不是联合保证金 / Multi-Assets）：联合保证金不支持逐仓，USDT 和 USDC 的盈亏也会互相影响。
-3. `free -m` 的 available 至少约 450 MB（现在约 470 MB）。
+3. **内存以第 14 节的预算为准**：USDT 已经切到一个进程 `tradingbot-usdt`（btc / sol 已停、已取消自启），跑过至少一根 K 线；启动前 `free -m` 的 available 至少 **700 MB**（预计约 850）。原来写的“至少约 450 MB”没算 guard 每 5 分钟约 150 MB 的峰值，2026-11-02 就是这样卡死的（HANDOVER“踩过的坑”5）。
 
 ### 安装（admin 执行一次）
 
@@ -255,11 +257,11 @@ tail -n 80 /var/log/tradingbot-usdc.log
 
 ### 内存：部署后实测，再定 MemoryMax
 
-unit 里先给 `MemoryMax=600M`、`OOMScoreAdjust=500`（内存不够时内核先杀这个服务，不杀 USDT 的两个机器人）。跑满一根 K 线后看：
+unit 里先给 `MemoryMax=600M`、`OOMScoreAdjust=500`（内存不够时内核先杀这个服务，不杀 USDT 机器人）。跑满一根 K 线后看：
 
 ```bash
 cat /sys/fs/cgroup/system.slice/tradingbot-usdc.service/memory.peak   # 启动以来峰值（含页缓存）
-cat /sys/fs/cgroup/system.slice/tradingbot-btc.service/memory.peak    # 对照：单币进程
+cat /sys/fs/cgroup/system.slice/tradingbot-usdt.service/memory.peak   # 对照：USDT 两个币的进程
 ps -o pid,rss,cmd -u tradingbot
 free -m
 ```
@@ -276,7 +278,7 @@ Binance U 本位按 IP 每分钟 2400 权重；行情走正式站（公开接口
 | K 线收盘那一轮 | 每个币 3 次 ticker + 1 次 K 线（5）= 8，共 72 | 每个币读持仓 5 + 余额 5 = 10，共 90；9 个币同时反手最多约 290 |
 | 启动 | 市场表 + 每个币约 9，共约 85 | 每个币约 58（持仓模式 30、逐仓 / 杠杆 / 单向各 1、持仓 5 × 3、余额 5 × 2），共约 530；有开仓再加，最多约 820 |
 
-下单本身不算 IP 权重，只算订单数（每 10 秒 300 单），一轮最多 18 单。USDT 的两个机器人平时每分钟只有约 4 权重。所以 K 线收盘那一分钟 Demo 最多用到上限的约 12%，正式站约 4%；启动那一分钟 Demo 约 22%~34%。就算进程反复崩溃重启（每 30 秒一次），每分钟也在 1000 以内。
+下单本身不算 IP 权重，只算订单数（每 10 秒 300 单），一轮最多 18 单。USDT 机器人（BTC + SOL）平时每分钟只有约 4 权重。所以 K 线收盘那一分钟 Demo 最多用到上限的约 12%，正式站约 4%；启动那一分钟 Demo 约 22%~34%。就算进程反复崩溃重启（每 30 秒一次），每分钟也在 1000 以内。
 
 ### 停止开新仓 / 恢复
 
@@ -354,3 +356,125 @@ cd /opt/tradingbot && sudo -n -u tradingbot .venv/bin/python tools/portfolio_gua
 | 手动平掉 USDC 仓位 | `python tools/portfolio_guard.py --asset USDC --flatten`（不改停机状态） |
 | 只让 USDC 机器人停止开新仓 | 建 `data/HALT_USDC`，内容写原因 |
 | 卸载 | `sudo systemctl disable --now tradingbot-guard-usdc.timer && sudo rm /etc/systemd/system/tradingbot-guard-usdc.{service,timer} && sudo systemctl daemon-reload` |
+
+
+## 14. USDT：BTC + SOL 合成一个进程（`tradingbot-usdt.service`）
+
+**为什么**：2026-11-02 21:25 启动 USDC 篮子后 available 只剩约 128 MB，21:27:12 USDC 的 guard（oneshot，约 150 MB）一跑，内存被挤爆，整机卡死，只能强制重启（HANDOVER“踩过的坑”5）。USDC 机器人已停、已取消开机自启。USDT 的两个单币进程各约 365 MB，合成一个能省下约 340 MB。
+
+**只改运行方式，别的都不变**：
+
+| | 以前（已被取代） | 现在 |
+| --- | --- | --- |
+| systemd | `tradingbot-btc.service`、`tradingbot-sol.service` | `tradingbot-usdt.service` |
+| 命令 | `main.py testnet --config config.portfolio.yaml --symbol BTC/USDT`（SOL 同样一个） | `main.py testnet-multi --config config.portfolio.yaml --symbols BTC/USDT,SOL/USDT` |
+| 日志 | `/var/log/tradingbot-btc.log`、`/var/log/tradingbot-sol.log` | `/var/log/tradingbot-usdt.log`，每行带 `[BTC/USDT]` / `[SOL/USDT]`，进程级的行是 `[-]` |
+| 配置 | `config.portfolio.yaml` | 同一个文件，不用改（币种由 `--symbols` 传；`equity_fraction` 0.5 × 2 个币 = 100%） |
+| 账本 / run 名 | `data/portfolio.db`；`testnet:binance:perp:BTC/USDT:USDT:4h:ma_cross`、`…SOL/USDT:USDT…` | 完全一样：两个币的持仓、止损、`last_signal`、风控状态直接接着用 |
+| 停机标志 / 闸门 | `data/HALT`；`tradingbot-guard.timer` | 一样 |
+| 内存设置 | `MemoryHigh=600M`，不设 `OOMScoreAdjust` | 一样（这是要保护的那个；USDC 篮子是 +500，内存不够时内核先杀它） |
+
+- 两个币仍然各有自己的 Trader、风控、对账和软止损，共用一个行情连接和一个下单连接（`bot/engine/live_multi.py`）。一个币出错只影响它自己，下一轮（30 秒后）先对账再重试；整个进程崩溃时两个币一起停，systemd 30 秒后重启。
+- 离线测试 `tests/test_usdt_one_process.py`：按 unit 里的 ExecStart 跑 `main.py`，单币进程写下的状态库，多币进程能原样恢复两个币（持仓、止损、`last_signal`），恢复后不重复下单，止损照常触发；回滚方向（多币写、单币读）也测了；从空账本起步时，下的单和两个单币进程一模一样。
+- `tradingbot-btc.service`、`tradingbot-sol.service` 留在仓库里，**已被 `tradingbot-usdt` 取代**，只用于回滚。**两边绝不能同时开**：同一个币会被两个进程同时交易、重复下单（看板会标红“同时有 2 个服务在跑”）。
+
+### 内存预算（服务器总内存 1613 MB）
+
+| 进程 | 事故时（2026-11-02 21:27） | 切换后、USDC 篮子在跑 |
+| --- | --- | --- |
+| 系统 + 看板 | ≈ 330 MB | ≈ 330 MB |
+| USDT 机器人 | btc ≈ 365 + sol ≈ 365 = 730 MB | usdt ≈ 370 MB（预计：多币进程每多一个币只多几 MB） |
+| USDC 篮子 | ≈ 380 MB | ≈ 380 MB |
+| `free -m` available（平时） | ≈ 128 MB（实测） | ≈ 470 MB（128 + 省下的约 340） |
+| guard 峰值（oneshot，每 5 分钟一次，每次约 150 MB；USDT、USDC 两个错开 2.5 分钟） | 一个 guard 就超了 → 卡死 | 一个 guard 在跑时约 320 MB；万一两个撞在一起约 170 MB |
+
+- 切换后、USDC 启动前，available 预计约 850 MB；USDC 启动条件见第 12 节“启动之前”（至少 700 MB）。
+- 实测之后以实测为准：`free -m`；`cat /sys/fs/cgroup/system.slice/tradingbot-usdt.service/memory.peak`；`ps -o pid,rss,cmd -u tradingbot`。平时 available 低于约 300 MB，或者 guard 运行时低于约 150 MB，就先停 USDC 篮子（`sudo -n systemctl stop tradingbot-usdc.service`），再商量。
+
+### 切换之前（Claude 做，只读）
+
+1. 服务器上的配置能直接用：`grep -nE 'equity_fraction|db_path|halt_file|symbols' /opt/tradingbot/config.portfolio.yaml`，应看到 `equity_fraction: 0.5`、`db_path: data/portfolio.db`，没有 `halt_file`（缺省就是 `data/HALT`）也没有 `symbols`。`equity_fraction` 大于 0.5 的话 `testnet-multi` 会报“超过账户权益”退出（systemd 会反复重启），先停下来商量。claude-ops 读不了这个文件就请 admin 用 `sudo -u tradingbot grep …` 看。
+2. 记下两个币现在的状态，切换后对照：
+   ```bash
+   grep 'K 线收盘' /var/log/tradingbot-btc.log | tail -n 1     # close / 信号 / 持仓 / 止损
+   grep 'K 线收盘' /var/log/tradingbot-sol.log | tail -n 1
+   cd /opt/tradingbot && sudo -n -u tradingbot .venv/bin/python tools/forward_status.py
+   cd /opt/tradingbot && sudo -n -u tradingbot .venv/bin/python tools/portfolio_guard.py --status
+   ```
+3. `free -m` 记一下 available（切换后应多出约 340 MB）。
+
+### 安装（admin 执行一次）
+
+```bash
+sudo -u tradingbot git -C /opt/tradingbot pull --ff-only
+sudo cp /opt/tradingbot/deploy/systemd/tradingbot-usdt.service /etc/systemd/system/
+sudo systemctl daemon-reload
+# 只改开机自启，不停、不启动：正在跑的 btc / sol 不受影响，切换由 Claude 挑时间做
+sudo systemctl disable tradingbot-btc.service tradingbot-sol.service
+sudo systemctl enable tradingbot-usdt.service
+
+# 让 claude-ops 能启停这个服务（和 btc / sol 那几条同样的写法）
+sudo tee /etc/sudoers.d/claude-ops-usdt >/dev/null <<'RULES'
+claude-ops ALL=(root) NOPASSWD: /usr/bin/systemctl start tradingbot-usdt.service, /usr/bin/systemctl stop tradingbot-usdt.service, /usr/bin/systemctl restart tradingbot-usdt.service
+RULES
+sudo chmod 440 /etc/sudoers.d/claude-ops-usdt
+sudo visudo -cf /etc/sudoers.d/claude-ops-usdt       # 必须输出 parsed OK
+
+sudo systemctl restart tradingbot-dashboard          # 看板换新代码；切换前后都能正确显示，不用等切换
+```
+
+btc / sol 原来的 sudoers 规则（start / stop / restart）留着，回滚要用。装完到切换之间如果机器重启了，开机起来的就是 `tradingbot-usdt`（btc / sol 已取消自启），等于提前切换了，按下面“核对”一节检查即可。
+
+### 切换（Claude 做，避开 4h 收盘：北京时间 00/04/08/12/16/20 点）
+
+收盘前 10 分钟到收盘后 15 分钟之间不要动（收盘后机器人要处理 K 线、可能下单）。**先停两个旧的，再起新的**，中间不要让两边同时在跑：
+
+```bash
+sudo -n systemctl stop tradingbot-btc.service
+sudo -n systemctl stop tradingbot-sol.service
+systemctl is-active tradingbot-btc.service tradingbot-sol.service   # 两行都要是 inactive
+sudo -n systemctl start tradingbot-usdt.service
+```
+
+（admin 自己切也行，一条命令：`sudo systemctl disable --now tradingbot-btc.service tradingbot-sol.service && sudo systemctl enable --now tradingbot-usdt.service`。）
+
+### 核对：两个币都接上了原来的持仓和止损
+
+```bash
+tail -n 40 /var/log/tradingbot-usdt.log
+grep 'K 线收盘' /var/log/tradingbot-usdt.log | tail -n 2
+```
+
+正常的样子：
+
+- `[-]` 一行 `账户 USDT 权益 …，每个币按 … 定仓位`，一行 `启动 testnet 模式（一个进程 2 个币）`；
+- `[BTC/USDT]`、`[SOL/USDT]` 各有 `已恢复上次运行状态 (testnet:binance:perp:BTC/USDT:USDT:4h:ma_cross)`（SOL 同样），然后 `已加载 … 根 K 线`、`K 线收盘 …`；
+- 两条 `K 线收盘` 和切换前记下的最后一条比：同一根 K 线（时间、close 一样）、信号一样、持仓方向和数量一样、止损一样（权益可能差一点，是重新读了余额）；
+- **没有** `本地持仓与交易所不一致`、没有 ERROR，也没有新成交（`forward_status.py` 的成交数和切换前一样）；
+- `portfolio_guard.py --status` 的持仓数和切换前一样；`free -m` 的 available 多出约 340 MB；看板上两个币都显示“运行中”，告警区没有“服务未运行”。
+
+哪个币**没有**“已恢复上次运行状态”，说明 run 名对不上、它从空状态起步了：立刻按下面回滚，不要等下一根 K 线。
+
+### 回滚（回到一个币一个进程）
+
+同样避开收盘。**USDC 篮子要先停**：不停的话内存就回到事故时的样子。
+
+```bash
+sudo -n systemctl stop tradingbot-usdc.service       # 在跑的话
+sudo -n systemctl stop tradingbot-usdt.service
+systemctl is-active tradingbot-usdt.service          # inactive
+sudo -n systemctl start tradingbot-btc.service
+sudo -n systemctl start tradingbot-sol.service
+tail -n 20 /var/log/tradingbot-btc.log /var/log/tradingbot-sol.log   # 各有“已恢复上次运行状态”
+```
+
+然后请 admin 把开机自启改回来：`sudo systemctl disable tradingbot-usdt.service && sudo systemctl enable tradingbot-btc.service tradingbot-sol.service`（USDC 篮子在 `tradingbot-usdt` 恢复之前不要再开）。账本和 run 名两边一样，多币进程期间的持仓、止损和成交单币进程直接接着用（测试里测过这个方向）；看板会自动改看 btc / sol 的服务和日志，不用改。
+
+### 日常运维
+
+| 动作 | 命令 |
+| --- | --- |
+| 看日志 | `tail -f /var/log/tradingbot-usdt.log`；只看一个币 `grep '\[SOL/USDT\]' /var/log/tradingbot-usdt.log \| tail` |
+| 重启（两个币一起） | `sudo -n systemctl restart tradingbot-usdt.service`（避开收盘） |
+| 部署新代码 | `git pull --ff-only` 之后重启 `tradingbot-usdt`（不再是 btc / sol） |
+| 停止开新仓 / 恢复 | 和以前一样：建 / 删 `data/HALT` |

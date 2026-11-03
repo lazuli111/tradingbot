@@ -1,0 +1,28 @@
+[Unit]
+Description=Trading bot forward test - USDT BTC + SOL in one process (Binance demo)
+# 取代 tradingbot-btc / tradingbot-sol（一个币一个进程，各约 365 MB）：同样的策略、参数、账本
+# data/portfolio.db（run 名不变，两个币的持仓和止损直接接着用）和停机标志 data/HALT，只是合成一个进程，
+# 省下约 340 MB 给 USDC 篮子。切换和回滚步骤见 DEPLOY.md 第 14 节。不要和 btc / sol 同时开：会重复下单。
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tradingbot
+WorkingDirectory=/opt/tradingbot
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=OMP_NUM_THREADS=1
+# 币种用 --symbols 传，服务器上的 config.portfolio.yaml 不用改（它的 equity_fraction 0.5 × 2 个币 = 100%）
+ExecStart=/opt/tradingbot/.venv/bin/python main.py testnet-multi --config config.portfolio.yaml --symbols BTC/USDT,SOL/USDT
+Restart=always
+RestartSec=30
+# 和 tradingbot-btc 一样只用软上限：超过后内核施压回收，不会杀进程（MemoryMax 的坑见 HANDOVER“踩过的坑”2）。
+# 不设 OOMScoreAdjust（默认 0）：这是要保护的那个，USDC 篮子是 +500，内存不够时内核先杀它。
+MemoryHigh=600M
+StandardOutput=append:/var/log/tradingbot-usdt.log
+StandardError=append:/var/log/tradingbot-usdt.log
+
+[Install]
+WantedBy=multi-user.target

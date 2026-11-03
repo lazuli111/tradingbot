@@ -31,13 +31,14 @@ PRICES = {p: 10.0 * (i + 1) for i, p in enumerate(PERPS)}   # a different price 
 
 
 class BasketExchange:
-    """One fake USD-M account with several USDC perps. Market orders fill at once at the coin's
-    `last`; `broken[method]` lists the coins for which that call raises a network error."""
+    """One fake USD-M account with several perps (the USDC basket unless `prices` says otherwise).
+    Market orders fill at once at the coin's `last`; `broken[method]` lists the coins for which
+    that call raises a network error."""
 
-    def __init__(self, usdc: float = 9000.0):
-        self.last = dict(PRICES)
-        self.pos = dict.fromkeys(PERPS, 0.0)     # signed contracts
-        self.entry = dict.fromkeys(PERPS, 0.0)
+    def __init__(self, usdc: float = 9000.0, prices: dict[str, float] | None = None):
+        self.last = dict(prices or PRICES)
+        self.pos = dict.fromkeys(self.last, 0.0)     # signed contracts
+        self.entry = dict.fromkeys(self.last, 0.0)
         self.balance = {"USDC": usdc, "USDT": 50_000.0}   # the USDT belongs to the other bots
         self.orders: list[dict] = []
         self.broken: dict[str, set] = {}
@@ -52,7 +53,8 @@ class BasketExchange:
     def market(self, symbol):
         if symbol not in self.last:
             raise ccxt.BadSymbol(f"binance does not have market symbol {symbol}")
-        return {"base": symbol.split("/")[0], "quote": "USDC", "settle": "USDC", "contractSize": 1,
+        settle = symbol.split(":")[1]
+        return {"base": symbol.split("/")[0], "quote": settle, "settle": settle, "contractSize": 1,
                 "limits": {"amount": {"min": 0.001}}}
 
     def set_margin_mode(self, *a):
@@ -88,7 +90,7 @@ class BasketExchange:
         oid = str(len(self.orders) + 1)
         self.orders.append({"id": oid, "symbol": symbol, "side": side, "amount": amount, "params": params})
         return {"id": oid, "status": "closed", "average": last, "filled": amount,
-                "fee": {"cost": amount * last * 0.0005, "currency": "USDC"}}
+                "fee": {"cost": amount * last * 0.0005, "currency": symbol.split(":")[1]}}
 
     def fetch_positions(self, symbols):
         out = []
@@ -107,19 +109,19 @@ class BasketExchange:
 class Chart:
     """Stands in for fetch_ohlcv_range: closed 4h bars per coin, served from `since` on."""
 
-    def __init__(self):
+    def __init__(self, prices: dict[str, float] | None = None):
         start = (int(time.time() * 1000) // BAR - 60) * BAR
         # wide bars (±2%) so the risk-based size, not the leverage cap, sets the quantity
-        self.bars = {p: make_ohlcv(np.full(60, PRICES[p]), start_ts=start, spread=0.02).assign(
-            timestamp=lambda d: start + np.arange(len(d)) * BAR) for p in PERPS}
+        self.bars = {p: make_ohlcv(np.full(60, price), start_ts=start, spread=0.02).assign(
+            timestamp=lambda d: start + np.arange(len(d)) * BAR) for p, price in (prices or PRICES).items()}
 
     def __call__(self, ex, symbol, timeframe, since, until):
         df = self.bars[symbol]
         return df[df["timestamp"] >= since].reset_index(drop=True)
 
-    def close_bar(self, ex, symbols=PERPS):
-        """The next bar closes for these coins (at their current `last`)."""
-        for p in symbols:
+    def close_bar(self, ex, symbols=None):
+        """The next bar closes for these coins (all of them by default), at their current `last`."""
+        for p in symbols or list(self.bars):
             df = self.bars[p]
             nxt = make_ohlcv([ex.last[p]], start_ts=int(df["timestamp"].iloc[-1]) + BAR, spread=0.02)
             self.bars[p] = pd.concat([df, nxt], ignore_index=True)
