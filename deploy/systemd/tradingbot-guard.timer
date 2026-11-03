@@ -1,10 +1,16 @@
 [Unit]
-Description=Run the portfolio guard every 5 minutes
+Description=Run the USDT portfolio guard every 5 minutes, on the clock (mm:ss 00:00, 05:00, ... 55:00)
 
 [Timer]
-OnBootSec=2min
-OnUnitActiveSec=5min
-AccuracySec=30s
+# 按钟点触发：每 5 分钟周期的第 0 分 00 秒，即每小时的 00:00、05:00 … 55:00（分:秒）。
+# USDC 闸门（tradingbot-guard-usdc.timer）在周期的第 2 分 30 秒，两边相差 2.5 分钟：
+# 每个 guard 约 150 MB，1.6 GB 的机器上两个同时跑会重现 2026-11-02 的内存卡死。
+# 不用 OnBootSec + OnUnitActiveSec：那种时刻是“上一次运行 + 5 分钟”，systemd 还会把 AccuracySec
+# 窗口里的唤醒对到一起，2026-11-02 强制重启后两个 timer 就漂到了同一时刻，对齐之后一直对齐。
+# OnCalendar 只跟钟走，和开机时间、上一次运行无关；AccuracySec=1s 最多晚 1 秒，没有合并的余地。
+# enable --now 不会立刻跑一次，第一次就在下一个整 5 分钟。
+OnCalendar=*:0/5:00
+AccuracySec=1s
 
 [Install]
 WantedBy=timers.target

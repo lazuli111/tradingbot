@@ -1,12 +1,13 @@
 [Unit]
-Description=Run the USDC portfolio guard every 5 minutes, 2.5 minutes after the USDT guard
+Description=Run the USDC portfolio guard every 5 minutes, 2.5 minutes after the USDT guard (mm:ss 02:30, 07:30, ... 57:30)
 
 [Timer]
-# tradingbot-guard.timer 是开机 2 分钟后、之后每 5 分钟；这里晚 2.5 分钟，两个 Python 进程不同时占内存。
-# 机器已经开着时 enable --now 会立刻跑一次，之后按那一刻每 5 分钟（错开的做法见 DEPLOY.md）
-OnBootSec=4min30s
-OnUnitActiveSec=5min
-AccuracySec=30s
+# 按钟点触发：每 5 分钟周期的第 2 分 30 秒，即每小时的 02:30、07:30 … 57:30（分:秒）。
+# USDT 闸门（tradingbot-guard.timer）在周期的第 0 分 00 秒，这里比它晚 2.5 分钟、比它下一次早 2.5 分钟，
+# 两个约 150 MB 的 Python 进程不同时跑。为什么不用 OnBootSec + OnUnitActiveSec 见 tradingbot-guard.timer。
+# enable --now 不会立刻跑一次，第一次就在下一个 02:30 / 07:30 …
+OnCalendar=*:2/5:30
+AccuracySec=1s
 
 [Install]
 WantedBy=timers.target
