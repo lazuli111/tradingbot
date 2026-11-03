@@ -1,5 +1,7 @@
 [Unit]
 Description=Trading bot forward test - BTC/USDT (Binance demo)
+# 已被 tradingbot-usdt.service 取代（2026-11，BTC + SOL 合成一个进程）。留着是为了回滚，
+# 步骤见 DEPLOY.md 第 14 节；不要和 tradingbot-usdt 同时开：会重复下单。
 After=network-online.target
 Wants=network-online.target
 

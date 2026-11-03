@@ -1,5 +1,7 @@
 [Unit]
 Description=Trading bot forward test - SOL/USDT (Binance demo)
+# 已被 tradingbot-usdt.service 取代（2026-11，BTC + SOL 合成一个进程）。留着是为了回滚，
+# 步骤见 DEPLOY.md 第 14 节；不要和 tradingbot-usdt 同时开：会重复下单。
 # 注意：1 GB 内存的机器不要同时开 btc + sol，两个 Python 进程会互相挤爆（实测过）。
 # 想跑第二个品种，先把实例升到 2 GB，再加这个 unit 并把 config 里的 equity_fraction 改成 1/3 或 0.5。
 After=network-online.target
