@@ -56,7 +56,7 @@ h2 { font-size: 15px; margin: 0 0 10px; }
 .alerts { list-style: none; margin: 0; padding: 0; }
 .alerts li { display: flex; gap: 8px; align-items: baseline; padding: 3px 0; }
 .alerts li .dot { position: relative; top: -1px; }
-.bots { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
+.bots { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; margin-bottom: 12px; }
 .bots .card { margin-bottom: 0; }
 .kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; margin: 0; }
 .kv dt { color: var(--text-2); } .kv dd { margin: 0; text-align: right; }
@@ -88,6 +88,20 @@ button { font: inherit; font-size: 13px; padding: 3px 12px; border-radius: 6px; 
 footer { color: var(--muted); font-size: 12px; margin-top: 16px; }
 footer p { margin: 4px 0; }
 .empty { color: var(--muted); }
+.tabs { display: flex; gap: 8px; margin-bottom: 12px; }
+.tab { flex: 1 1 0; min-width: 0; display: block; text-decoration: none; color: var(--text); background: var(--surface);
+  border: 1px solid var(--border); border-radius: 10px; padding: 8px 12px; }
+.tab[aria-selected="true"] { border-color: var(--series); box-shadow: inset 0 -3px 0 var(--series); }
+.tab .t1 { display: flex; align-items: center; gap: 6px; font-weight: 600; font-size: 15px; }
+.tab .t2 { display: block; color: var(--text-2); font-size: 12px; }
+.chip { flex: none; font-size: 11px; line-height: 18px; padding: 0 6px; border-radius: 4px; background: var(--grid);
+  color: var(--text-2); text-decoration: none; }
+table.coins { font-size: 12px; }
+table.coins th, table.coins td { padding: 4px 6px; text-align: right; vertical-align: top; }
+table.coins th:first-child, table.coins td:first-child { text-align: left; position: sticky; left: 0; background: var(--surface); font-weight: 600; }
+table.coins th:nth-child(2), table.coins td:nth-child(2) { text-align: left; }
+.c2 { display: block; color: var(--text-2); font-size: 11px; }
+#coins-svc { margin-bottom: 6px; }
 </style>
 </head>
 <body>
@@ -102,10 +116,14 @@ footer p { margin: 4px 0; }
   <div id="banner" class="card"></div>
   <div id="alerts-card" class="card"><h2>告警</h2><ul id="alerts" class="alerts"></ul></div>
 
+  <nav class="tabs" id="tabs" role="tablist" aria-label="保证金资产"></nav>
+
+  <div id="panel" role="tabpanel">
+  <div id="disabled" class="card empty"></div>
   <section class="tiles" id="tiles"></section>
 
-  <div class="card">
-    <h2>账户总权益（Binance Demo，guard 每 5 分钟记录一次）</h2>
+  <div class="card" id="chart-card">
+    <h2 id="chart-title">账户总权益</h2>
     <div class="chartwrap">
       <svg id="chart" role="img" aria-label="账户权益曲线"></svg>
       <div id="tip"></div>
@@ -114,8 +132,17 @@ footer p { margin: 4px 0; }
   </div>
 
   <section class="bots" id="bots"></section>
+  <div class="card" id="coins-card">
+    <h2>各币状态</h2>
+    <div class="meta" id="coins-svc"></div>
+    <div class="tablewrap"><table class="coins">
+      <thead><tr><th>币</th><th>持仓</th><th>浮动盈亏</th><th>止损</th><th>入场 / 标记</th><th>信号</th><th>K 线收盘</th><th>24h ERR / 对账</th></tr></thead>
+      <tbody id="coins"></tbody>
+    </table></div>
+    <details><summary id="coins-log-sum"></summary><ul class="loglist" id="coins-log"></ul></details>
+  </div>
 
-  <div class="card" style="margin-top:12px">
+  <div class="card" id="fills-card">
     <h2>成交记录</h2>
     <div class="tablewrap"><table>
       <thead><tr><th>时间</th><th>品种</th><th>方向</th><th>数量</th><th>价格</th><th>手续费</th><th>盈亏</th><th>原因</th></tr></thead>
@@ -123,14 +150,17 @@ footer p { margin: 4px 0; }
     </table></div>
   </div>
 
-  <div class="card">
-    <h2>组合 guard</h2>
+  <div class="card" id="guard-card">
+    <h2 id="guard-title">组合 guard</h2>
     <dl class="kv" id="guard"></dl>
     <details><summary>guard 事件（清仓、检查失败）</summary><ul class="loglist" id="guard-events"></ul></details>
+  </div>
   </div>
 
   <footer>
     <p>只读看板：没有任何下单、平仓或启停服务的操作。页面每 60 秒自动刷新，服务端快照最多缓存 30 秒。</p>
+    <p>同一个 Demo 账户按保证金资产分两套：USDT（BTC + SOL，每笔风险 1%）和 USDC（9 币篮子，每笔 3%），
+       各有自己的 guard（回撤 20% 停机）和停机标志。上面的告警是两套合在一起的，前面标着是哪一套。</p>
     <p>判断数据是否过期：顶部“数据生成于”超过 2 分钟（或显示连接失败）说明看板服务或 SSH 隧道断了；
        账户权益的“记录于”超过 12 分钟说明 guard 没在跑；机器人 K 线收盘后超过 4.5 小时没有新 K 线说明机器人卡住了。以上都会在“告警”里标出。</p>
     <p>时间均为本机时区；K 线开收盘时间另附 UTC。</p>
@@ -180,6 +210,7 @@ const pct = (v, d = 2) => v == null ? "—" : `${v >= 0 ? "+" : "−"}${Math.abs
 const signed = (v, d = 2) => v == null ? "—" : `${v >= 0 ? "+" : "−"}${num(Math.abs(v), d)}`;
 const tone = (v) => v == null || v === 0 ? "" : (v > 0 ? "pos" : "neg");
 function qtyFmt(q) { return q == null ? "—" : String(+Number(q).toPrecision(8)); }
+const px = (v) => v == null ? "—" : num(v, v >= 1000 ? 2 : v >= 10 ? 3 : 4);  // ADA、XRP 这类低价币多给两位
 function badge(level, text) {
   return h("span", { class: `badge lv-${level}` }, h("span", { class: "dot" }), text || LEVEL_TEXT[level]);
 }
@@ -212,37 +243,75 @@ function render() {
   ov.replaceWith(Object.assign(worst ? badge(worst.level, LEVEL_TEXT[worst.level]) : badge("good", "一切正常"), { id: "overall" }));
   const ul = $("alerts");
   ul.replaceChildren(...alerts.map((a) => h("li", { class: `lv-${a.level}` }, h("span", { class: "dot" }),
+    a.account ? h("a", { class: "chip", href: `#${a.account.toLowerCase()}` }, a.account) : null,
     h("span", {}, `${LEVEL_TEXT[a.level]}：`, a.text))));
   $("alerts-card").style.display = alerts.length ? "" : "none";
 
-  renderTiles(snap.account);
-  renderChart(snap);
-  renderBots(snap);
-  renderFills(snap.fills);
-  renderGuard(snap);
+  const acct = current();
+  renderTabs(acct, alerts);
+  renderAccount(acct);
+}
+
+// 两套账户：USDT 的字段在快照顶层（和只有它一套时一样），USDC 在 snap.usdc；选哪套记在网址 #usdt / #usdc 里
+function accounts() { return [snap, snap.usdc].filter(Boolean); }
+function current() {
+  const key = location.hash.slice(1).toUpperCase();
+  return accounts().find((a) => a.asset === key) || snap;
+}
+function coinsLabel(acct) {
+  const names = acct.bots.map((b) => b.name);
+  return names.length <= 3 ? names.join(" + ") : `${names.length} 币篮子`;
+}
+function renderTabs(cur, alerts) {
+  $("tabs").replaceChildren(...accounts().map((acct) => {
+    const bad = alerts.find((a) => a.account === acct.asset && a.level !== "info");
+    const level = !acct.enabled ? "info" : bad ? bad.level : "good";
+    const a = acct.account;
+    const sub = !acct.enabled ? "未启用" : a ? h("span", { class: "num" }, `${coinsLabel(acct)} · ${num(a.equity)} · `,
+      h("span", { class: tone(a.return) }, pct(a.return))) : `${coinsLabel(acct)} · 还没有权益记录`;
+    return h("a", { class: `tab lv-${level}`, href: `#${acct.asset.toLowerCase()}`, role: "tab",
+      "aria-selected": String(acct === cur), title: LEVEL_TEXT[level] },
+      h("span", { class: "t1" }, h("span", { class: "dot" }), acct.asset), h("span", { class: "t2" }, sub));
+  }));
+}
+function renderAccount(acct) {
+  const on = acct.enabled;
+  for (const id of ["tiles", "chart-card", "fills-card", "guard-card"]) $(id).style.display = on ? "" : "none";
+  $("disabled").style.display = on ? "none" : "";
+  if (!on) {
+    $("bots").style.display = $("coins-card").style.display = "none";
+    $("disabled").textContent = `${acct.asset} 这一套未启用（${acct.disabled_reason}），不检查也不报警。启动后这里会显示它的权益、持仓和 guard。`;
+    return;
+  }
+  renderTiles(acct);
+  renderChart(acct);
+  renderBots(acct);
+  renderFills(acct.fills);
+  renderGuard(acct);
 }
 
 function tile(label, value, sub, cls) {
   return h("div", { class: "tile" }, h("div", { class: "label" }, label),
     h("div", { class: `value num ${cls || ""}` }, value), h("div", { class: "sub num" }, sub));
 }
-function renderTiles(a) {
-  const el = $("tiles");
-  if (!a) { el.replaceChildren(tile("账户权益", "—", "guard 日志里还没有记录")); return; }
+function renderTiles(acct) {
+  const el = $("tiles"), a = acct.account, cur = acct.asset;
+  if (!a) { el.replaceChildren(tile(`${cur} 权益`, "—", "guard 日志里还没有记录")); return; }
   const stale = Date.now() - a.as_of > snap.thresholds.guard_stale_min * 60000;
   el.replaceChildren(
-    tile("账户总权益 (USDT)", num(a.equity),
+    tile(`${cur} 权益`, num(a.equity),
       h("span", {}, h("span", { class: tone(a.return) }, pct(a.return)), ` 自 ${fmtTime(a.start_ts)} 起（${num(a.start_equity)}）`)),
     tile("相对峰值回撤", pct(a.drawdown), `峰值 ${num(a.peak)}`, a.drawdown < 0 ? "neg" : ""),
     tile(`离 guard 熔断线（回撤 −${(a.max_dd * 100).toFixed(0)}%）`, `还差 ${(a.distance_pct * 100).toFixed(2)} 点`,
-      `再亏 ${num(a.distance)} USDT 触发 · 熔断线 ${num(a.guard_line)}`, a.distance_pct < 0.05 ? "neg" : ""),
-    tile("持仓 / 可用", `${a.positions} 个`, `可用 ${num(a.free)} USDT`),
+      `再亏 ${num(a.distance)} ${cur} 触发 · 熔断线 ${num(a.guard_line)}`, a.distance_pct < 0.05 ? "neg" : ""),
+    tile("持仓 / 可用", `${a.positions} 个`, `可用 ${num(a.free)} ${cur}`),
     tile("权益记录于", ago(a.as_of), h("span", {}, fmtTime(a.as_of, true), stale ? " · ⚠ 已过期" : ""), stale ? "neg" : ""),
   );
 }
 
-function renderChart(s) {
-  const el = $("chart"), a = s.account, pts = s.curve;
+function renderChart(acct) {
+  const el = $("chart"), a = acct.account, pts = acct.curve;
+  $("chart-title").textContent = `${acct.asset} 权益（Binance Demo，guard 每 5 分钟记录一次）`;
   const legend = $("legend");
   el.replaceChildren();
   legend.replaceChildren();
@@ -304,7 +373,7 @@ function renderChart(s) {
     const cx = x(best[0]), cy = y(best[1]);
     for (const n of [cross]) { n.setAttribute("x1", cx); n.setAttribute("x2", cx); n.setAttribute("visibility", "visible"); }
     dot.setAttribute("cx", cx); dot.setAttribute("cy", cy); dot.setAttribute("visibility", "visible");
-    tip.replaceChildren(h("b", { class: "num" }, num(best[1])), " USDT", h("br"),
+    tip.replaceChildren(h("b", { class: "num" }, num(best[1])), ` ${acct.asset}`, h("br"),
       h("span", { class: "num" }, `回撤 ${pct(best[1] / peak - 1)}`), h("br"),
       h("span", { class: "num", style: "color:var(--text-2)" }, fmtTime(best[0], true)));
     tip.style.display = "block";
@@ -323,47 +392,95 @@ function niceStep(raw) {
   return (f < 1.5 ? 1 : f < 3.5 ? 2 : f < 7.5 ? 5 : 10) * p;
 }
 
-function renderBots(s) {
-  const barMs = s.bar_hours * 3600000, limit = barMs + s.thresholds.bar_grace_min * 60000;
-  $("bots").replaceChildren(...s.bots.map((b) => {
+function serviceBadge(svc) {
+  const running = svc.ActiveState === "active";
+  const since = svc.ActiveEnterTimestamp && svc.ActiveEnterTimestamp.startsWith("@") ? +svc.ActiveEnterTimestamp.slice(1) * 1000 : null;
+  return h("span", {}, badge(running ? "good" : "critical", running ? "运行中" : (svc.ActiveState || "未知")),
+    since ? ` 自 ${fmtTime(since)}` : "", svc.NRestarts && svc.NRestarts !== "0" ? ` · 重启 ${svc.NRestarts} 次` : "",
+    svc.source === "cgroup" ? h("span", { style: "color:var(--muted)" }, "（按进程判断）") : null);
+}
+function sigText(s) { return s == null ? "—" : s > 0 ? "+1 看多" : s < 0 ? "−1 看空" : "0 空仓"; }
+function botLogs(bots) {
+  return bots.flatMap((b) => [...b.errors.map((e) => ({ ...e, kind: "ERROR", coin: b.name })),
+    ...b.warnings.map((w) => ({ ...w, kind: "对账", coin: b.name }))]).sort((x, y) => y.ts - x.ts);
+}
+function logItems(logs, withCoin) {
+  return logs.length ? logs.map((l) => h("li", {}, h("span", { class: "t num" }, `${fmtTime(l.ts)} ${withCoin ? l.coin + " " : ""}${l.kind}`), l.text,
+    l.detail ? h("span", { class: "d" }, l.detail) : null)) : [h("li", { class: "empty" }, "无")];
+}
+
+function renderBots(acct) {
+  const many = acct.bots.length > 3;
+  $("bots").style.display = many ? "none" : "";
+  $("coins-card").style.display = many ? "" : "none";
+  if (many) { renderCoins(acct); return; }
+  const cur = acct.asset;
+  const barMs = snap.bar_hours * 3600000, limit = barMs + snap.thresholds.bar_grace_min * 60000;
+  $("bots").replaceChildren(...acct.bots.map((b) => {
     const svc = b.service || {};
-    const running = svc.ActiveState === "active";
-    const since = svc.ActiveEnterTimestamp && svc.ActiveEnterTimestamp.startsWith("@") ? +svc.ActiveEnterTimestamp.slice(1) * 1000 : null;
     const p = b.position, lb = b.last_bar;
     const rows = [];
     const row = (k, v, cls) => rows.push(h("dt", {}, k), h("dd", { class: `num ${cls || ""}` }, v));
-    row("服务", h("span", {}, badge(running ? "good" : "critical", running ? "运行中" : (svc.ActiveState || "未知")),
-      since ? ` 自 ${fmtTime(since)}` : "", svc.NRestarts && svc.NRestarts !== "0" ? ` · 重启 ${svc.NRestarts} 次` : "",
-      svc.source === "cgroup" ? h("span", { style: "color:var(--muted)" }, "（按进程判断）") : null));
+    row("服务", serviceBadge(svc));
     if (p) {
       row("持仓", `${p.side > 0 ? "多" : "空"} ${qtyFmt(p.qty)}`, p.side > 0 ? "pos" : "neg");
-      row("入场价", num(p.entry, p.entry < 1000 ? 3 : 2));
-      row("止损价", p.stop == null ? "无" : `${num(p.stop, p.stop < 1000 ? 3 : 2)}（${pct(p.stop / p.entry - 1)}）`);
-      row("标记价", p.mark == null ? "获取失败" : num(p.mark, p.mark < 1000 ? 3 : 2));
-      row("浮动盈亏", p.upnl == null ? "—" : `${signed(p.upnl)} USDT（${pct(p.upnl_pct)}）`, tone(p.upnl));
+      row("入场价", px(p.entry));
+      row("止损价", p.stop == null ? "无" : `${px(p.stop)}（${pct(p.stop / p.entry - 1)}）`, p.stop == null ? "neg" : "");
+      row("标记价", p.mark == null ? "获取失败" : px(p.mark));
+      row("浮动盈亏", p.upnl == null ? "—" : `${signed(p.upnl)} ${cur}（${pct(p.upnl_pct)}）`, tone(p.upnl));
       row("开仓时间", fmtTime(p.opened_at));
     } else {
       row("持仓", "无");
     }
     if (b.unresolved) row("待核对订单", String(b.unresolved.id || "?"), "neg");
     if (lb) {
-      const sig = lb.signal == null ? "—" : lb.signal > 0 ? "+1 看多" : lb.signal < 0 ? "−1 看空" : "0 空仓";
-      row("最近 K 线信号", sig);
+      row("最近 K 线信号", sigText(lb.signal));
       row("K 线收盘", h("span", {}, `${fmtTime(lb.close_ts)} `, h("span", { style: "color:var(--muted)" }, `(${fmtUtc(lb.close_ts)})`)));
-      if (lb.close != null) row("收盘价", num(lb.close, lb.close < 1000 ? 3 : 2));
+      if (lb.close != null) row("收盘价", px(lb.close));
       row("距收盘", `${ago(lb.close_ts)} / 警戒 ${(limit / 3600000).toFixed(1)} 小时`, b.bar_overdue ? "neg" : "");
       row("本币权益（账本）", num(lb.equity));
     } else {
       row("最近 K 线", "账本里还没有记录");
     }
-    const logs = [...b.errors.map((e) => ({ ...e, kind: "ERROR" })), ...b.warnings.map((w) => ({ ...w, kind: "对账" }))]
-      .sort((x, y) => y.ts - x.ts);
     const det = h("details", {}, h("summary", {}, `最近 ERROR ${b.errors.length} 条 · 对账警告 ${b.warnings.length} 条（24 小时内 ${b.errors_24h} / ${b.warnings_24h}）`),
-      logs.length ? h("ul", { class: "loglist" }, logs.map((l) => h("li", {}, h("span", { class: "t num" }, `${fmtTime(l.ts)} ${l.kind}`), l.text,
-        l.detail ? h("span", { class: "d" }, l.detail) : null))) : h("p", { class: "empty" }, "无"));
+      h("ul", { class: "loglist" }, logItems(botLogs([b]), false)));
     return h("div", { class: "card" }, h("div", { class: "bot-head" }, h("h2", {}, b.name, " ", h("span", { class: "meta" }, b.symbol)),
       b.bar_overdue ? badge("serious", "K 线超时") : null), h("dl", { class: "kv" }, rows), det);
   }));
+}
+
+// 币多（USDC 篮子 9 个）时一行一个币；手机上表格横向滑动，币名那一列固定在左边
+function renderCoins(acct) {
+  const limitH = snap.bar_hours + snap.thresholds.bar_grace_min / 60;
+  const units = new Map();
+  for (const b of acct.bots) {
+    if (!units.has(b.unit)) units.set(b.unit, { svc: b.service || {}, names: [] });
+    units.get(b.unit).names.push(b.name);
+  }
+  $("coins-svc").replaceChildren(...[...units].map(([unit, u]) => h("div", {}, `${unit}（${units.size > 1 ? u.names.join("、") : `${u.names.length} 个币`}）：`, serviceBadge(u.svc))),
+    h("div", {}, `有持仓 ${acct.bots.filter((b) => b.position).length} / ${acct.bots.length} 个币 · K 线收盘后 ${limitH.toFixed(1)} 小时还没有下一根算超时`));
+  const two = (a, b, cls) => h("td", { class: `num ${cls || ""}` }, a, b == null ? null : h("span", { class: "c2" }, b));
+  $("coins").replaceChildren(...acct.bots.map((b) => {
+    const p = b.position, lb = b.last_bar, svc = b.service || {};
+    const down = svc.ActiveState !== "active";
+    const name = h("td", { title: b.symbol }, down ? h("span", { class: "lv-critical", title: "服务未运行" }, h("span", { class: "dot" }), " ") : null, b.name);
+    const sig = lb ? lb.signal : b.last_signal;
+    const cells = p ? [
+      two(`${p.side > 0 ? "多" : "空"} ${qtyFmt(p.qty)}`, null, p.side > 0 ? "pos" : "neg"),
+      p.upnl == null ? two("—", "标记价缺") : two(signed(p.upnl), pct(p.upnl_pct), tone(p.upnl)),
+      p.stop == null ? two("无", null, "neg") : two(px(p.stop), pct(p.stop / p.entry - 1)),
+      two(px(p.entry), p.mark == null ? null : `→ ${px(p.mark)}`),
+    ] : [two("—"), two("—"), two("—"), two("—")];
+    return h("tr", {}, name, ...cells,
+      h("td", { class: `num ${tone(sig)}` }, sig == null ? "—" : sig > 0 ? "+1" : sig < 0 ? "−1" : "0"),
+      lb ? h("td", { class: `num ${b.bar_overdue ? "neg" : ""}`, title: `${fmtTime(lb.close_ts, true)}（${fmtUtc(lb.close_ts)}）` },
+        ago(lb.close_ts), b.bar_overdue ? " ⚠" : "") : two("无记录", null, "neg"),
+      two(`${b.errors_24h} / ${b.warnings_24h}`, null, b.errors_24h || b.warnings_24h ? "neg" : ""));
+  }));
+  const logs = botLogs(acct.bots);
+  const e24 = acct.bots.reduce((n, b) => n + b.errors_24h, 0), w24 = acct.bots.reduce((n, b) => n + b.warnings_24h, 0);
+  $("coins-log-sum").textContent = `最近 ERROR ${acct.bots.reduce((n, b) => n + b.errors.length, 0)} 条 · 对账警告 ${acct.bots.reduce((n, b) => n + b.warnings.length, 0)} 条（24 小时内 ${e24} / ${w24}）`;
+  $("coins-log").replaceChildren(...logItems(logs.slice(0, 30), true));
 }
 
 function renderFills(fills) {
@@ -373,16 +490,17 @@ function renderFills(fills) {
   tb.replaceChildren(...fills.map((f) => h("tr", {},
     h("td", { class: "num" }, fmtTime(f.ts, true)), h("td", {}, f.symbol),
     h("td", { class: f.side === "buy" ? "pos" : "neg" }, f.side === "buy" ? "买" : "卖"),
-    h("td", { class: "num" }, qtyFmt(f.qty)), h("td", { class: "num" }, num(f.price, f.price < 1000 ? 3 : 2)),
+    h("td", { class: "num" }, qtyFmt(f.qty)), h("td", { class: "num" }, px(f.price)),
     h("td", { class: "num" }, num(f.fee, 4)), h("td", { class: `num ${tone(f.pnl)}` }, f.pnl == null ? "—" : signed(f.pnl, 3)),
     h("td", {}, REASON[f.reason] ? `${REASON[f.reason]} (${f.reason})` : f.reason))));
 }
 
-function renderGuard(s) {
-  const g = s.guard, a = s.account;
+function renderGuard(acct) {
+  const g = acct.guard, a = acct.account;
   const ok = g.result === "success";
   const rows = [];
   const row = (k, v) => rows.push(h("dt", {}, k), h("dd", { class: "num" }, v));
+  $("guard-title").textContent = `组合 guard（${acct.asset}：${g.service}）`;
   if (g.systemd_error) {
     row("定时器 / 上次运行", badge("info", "读不到 systemd，按下面的权益记录时间判断"));
   } else {
@@ -392,13 +510,15 @@ function renderGuard(s) {
   }
   row("最后一条权益记录", `${fmtTime(g.last_line)}（${ago(g.last_line)}）`);
   row("停机状态", a ? (a.halted ? badge("critical", `已停机：${a.halt_reason || ""}`) : badge("good", "未停机")) : "—");
+  row(`停机标志 ${g.halt_file}`, g.halt_flag == null ? badge("good", "没有（照常开仓）") : badge("serious", `存在，不开新仓：${g.halt_flag}`));
   $("guard").replaceChildren(...rows);
   $("guard-events").replaceChildren(...(g.events.length ? g.events.map((e) => h("li", {}, h("span", { class: "t num" }, fmtTime(e.ts)), e.text))
     : [h("li", { class: "empty" }, "无")]));
 }
 
 $("refresh").addEventListener("click", load);
-let resizeT; addEventListener("resize", () => { clearTimeout(resizeT); resizeT = setTimeout(() => snap && renderChart(snap), 150); });
+addEventListener("hashchange", render);
+let resizeT; addEventListener("resize", () => { clearTimeout(resizeT); resizeT = setTimeout(() => snap && current().enabled && renderChart(current()), 150); });
 setInterval(load, REFRESH_MS);
 setInterval(() => { if (snap) { $("age").textContent = ago(snap.generated_at); } }, 10000);
 load();

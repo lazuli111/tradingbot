@@ -150,17 +150,21 @@ docker compose exec guard python tools/portfolio_guard.py --status   # 账户权
 
 ## 11. 只读看板（`tools/dashboard.py`）
 
-在自己的电脑或手机上看服务器上的权益曲线、回撤、持仓、成交和运行健康度。
+在自己的电脑或手机上看服务器上的权益曲线、回撤、持仓、成交和运行健康度。同一个 Demo 账户按保证金资产分两套显示（页面上两个标签）：USDT（BTC + SOL）和 USDC 9 币篮子（第 12、13 节），各有自己的权益曲线、峰值、回撤、离 20% 停机线的距离、持仓、止损、guard 和停机标志；告警合在一起列在最上面，每条前面标着 USDT 或 USDC。
 
 **安全设计**
 - 只监听 `127.0.0.1:8765`，不开任何新端口，代码也拒绝绑定非回环地址；只能通过 SSH 隧道访问。
-- 只读：只有 GET，页面上没有下单、平仓、启停按钮；账本用 SQLite `mode=ro` 打开，不写、不锁机器人的 `portfolio.db`。
+- 只读：只有 GET，页面上没有下单、平仓、启停按钮；账本用 SQLite `mode=ro` 打开，不写、不锁机器人的 `portfolio.db` / `usdc_basket.db`。
 - systemd 用 `DynamicUser=yes` 的临时用户运行，整个文件系统只读，`.env` / `.git` 不可见；不需要也读不到 API Key。浮动盈亏用 Binance Demo 的公开标记价接口计算。
 - 只认 `localhost` / `127.0.0.1` 的 Host 头（防 DNS rebinding；本地端口不限，隧道可以用别的本地端口），带 CSP、`X-Frame-Options: DENY`，页面不加载任何外部资源。
 
-**数据来源**：账本 `data/portfolio.db`（持仓、止损、K 线、成交）、`data/portfolio_guard.json`（峰值、停机状态）、`/var/log/tradingbot-guard.log`（账户总权益，每 5 分钟一行）、`/var/log/tradingbot-usdt.log`（ERROR、对账警告、最后一次 K 线处理；BTC、SOL 共用一个日志，按每行的 `[BTC/USDT]` / `[SOL/USDT]` 标签分开，进程级的 `[-]` 行两个币都算。还在跑单币服务 `tradingbot-btc/sol` 时自动改读 `/var/log/tradingbot-{btc,sol}.log`，见第 14 节）、`systemctl show`（服务和 guard 定时器状态；在沙箱里读不到时，服务是否在跑改看 `/sys/fs/cgroup` 里该服务有没有进程，guard 只看日志是否按时更新，告警区会有一条“读不到 systemd 状态”的提示，原因写进 `journalctl -u tradingbot-dashboard`）。
+**数据来源（USDT）**：账本 `data/portfolio.db`（持仓、止损、K 线、成交）、`data/portfolio_guard.json`（峰值、停机状态）、`/var/log/tradingbot-guard.log`（账户总权益，每 5 分钟一行）、`/var/log/tradingbot-usdt.log`（ERROR、对账警告、最后一次 K 线处理；BTC、SOL 共用一个日志，按每行的 `[BTC/USDT]` / `[SOL/USDT]` 标签分开，进程级的 `[-]` 行两个币都算。还在跑单币服务 `tradingbot-btc/sol` 时自动改读 `/var/log/tradingbot-{btc,sol}.log`，见第 14 节）、`systemctl show`（服务和 guard 定时器状态；在沙箱里读不到时，服务是否在跑改看 `/sys/fs/cgroup` 里该服务有没有进程，guard 只看日志是否按时更新，告警区会有一条“读不到 systemd 状态”的提示，原因写进 `journalctl -u tradingbot-dashboard`）、停机标志 `data/HALT`（存在就告警：机器人不开新仓）。
 
-**流量**：首次打开约 9 KB（gzip），之后每分钟拉一次约 3 KB 的快照；页面一直开着一天约 4 MB。服务端快照缓存 30 秒，多开几个页面也只采集一次。
+**数据来源（USDC）**：同样的东西换成 `data/usdc_basket.db`、`data/portfolio_guard_usdc.json`、`/var/log/tradingbot-guard-usdc.log`、`/var/log/tradingbot-usdc.log`（9 个币共用，按 `[BTC/USDC]` 这样的标签分开）、`tradingbot-guard-usdc.service` / `.timer`、`data/HALT_USDC`。**`data/usdc_basket.db` 不存在时这一套显示“未启用”**，不查也不报警；以后停掉篮子，要看板不再报“服务未运行”，把这个账本挪走（改名归档）就行，看板不用改也不用重启。USDT 那套不是可选的：账本读不到就报严重。
+
+**标记价**：只给有仓的币算浮动盈亏，每个品种每分钟最多请求一次 Demo 公开接口（两套最多 11 个，每次权重 1）；网络不通或被限频（418 / 429）时所有品种一起停一分钟，不会接着打。
+
+**流量**：首次打开约 11 KB（gzip），之后每分钟拉一次快照，刚开始约 3~5 KB，两套都跑满几个月后约 14 KB（两条权益曲线各最多 600 点）；页面一直开着一天约 5~20 MB。服务端快照缓存 30 秒，多开几个页面也只采集一次。
 
 ### 安装（admin 执行一次）
 
@@ -173,7 +177,7 @@ systemctl status tradingbot-dashboard --no-pager          # active (running)，�
 curl -s -H 'Host: 127.0.0.1:8765' http://127.0.0.1:8765/api/snapshot | head -c 300; echo
 ```
 
-不影响两个机器人：不需要重启它们，看板挂了也只影响看板自己。
+不影响机器人：不需要重启它们，看板挂了也只影响看板自己。
 
 ### 打开看板
 
@@ -194,7 +198,7 @@ ssh -N -L 8765:127.0.0.1:8765 admin@8.216.9.170
 | 顶部“数据生成于” | 1 分钟内（页面每 60 秒刷新） | 超过 2 分钟，或出现红色“连接看板服务失败”横条：SSH 隧道断了或看板服务停了，页面上是旧数据 |
 | “权益记录于” | 5 分钟内 | 超过 12 分钟：guard 没在跑（告警里会写） |
 | 机器人“距收盘” | 小于 4 小时 | 超过 4.5 小时（4h K 线 + 30 分钟余量）：机器人卡住了，告警标红 |
-| 告警区 | 只有提示 | 服务停止、guard 失败或停机、订单待核对、最近 24 小时的 ERROR / 对账警告都会列出 |
+| 告警区 | 只有提示 | 服务停止、guard 失败或停机、停机标志存在、有持仓没止损、订单待核对、最近 24 小时的 ERROR / 对账警告都会列出，前面标着 USDT / USDC |
 
 账户总权益来自 guard 每 5 分钟查一次交易所的结果，和 `portfolio_guard.py --status` 的实时值最多差 5 分钟的行情波动。持仓、止损、成交和 `forward_status.py` 读的是同一个账本，应完全一致。
 
