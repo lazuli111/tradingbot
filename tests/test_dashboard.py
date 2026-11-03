@@ -99,6 +99,7 @@ class Env:
             "tradingbot-guard.timer": {"ActiveState": "active", "LastTriggerUSec": "Thu 2026-10-22 04:15:00 UTC"},
         }
         self.mark_price = 105.0
+        self.marks = {}  # 品种 -> 标记价；没列的用 mark_price
         self.cgroup_states = {"tradingbot-btc.service": "active", "tradingbot-sol.service": "active"}
         self.cfg = dash.Config(root=self.root, guard_log=self.logs / "guard.log", log_tz=timezone.utc, bots={
             "BTC": ("tradingbot-btc.service", self.logs / "btc.log"),
@@ -114,7 +115,7 @@ class Env:
     def mark(self, symbol):
         if self.mark_price is None:
             raise TimeoutError("no network")
-        return self.mark_price
+        return self.marks.get(symbol, self.mark_price)
 
     def snapshot(self, now=NOW, show=None):
         return dash.build_snapshot(self.cfg, now, show=show or self.show, mark=self.mark, cgroup=self.cgroup)
@@ -447,6 +448,316 @@ def test_two_services_trading_one_coin_is_critical(shared):
     assert found[0] == ("critical", "BTC 同时有 2 个服务在跑（tradingbot-usdt.service、tradingbot-btc.service），"
                                     "会重复下单：停掉多余的")
     assert not any(t.startswith("SOL 同时") for _, t in found)
+
+
+# ---- USDC 篮子：9 个币一个进程，和 USDT 并排的第二套 -------------------------------
+
+USDC_RUNS = {c: f"testnet:binance:perp:{c}/USDC:USDC:4h:ma_cross" for c in dash.USDC_COINS}
+USDC_CLOSE = {"BTC": "82901.10", "SOL": "105.52", "ETH": "3890.15", "XRP": "2.45", "LTC": "98.30",
+              "BCH": "480.90", "ADA": "0.71", "LINK": "17.82", "BNB": "690.40"}
+ETH_POS = {"side": 1, "qty": 0.4, "entry": 3850.0, "opened_at": BAR0 - 8 * H, "entry_fee": 0.77,
+           "margin": 513.3, "liq_price": 2600.0, "stop": 3700.0, "take_profit": None, "funding": 0.0}
+ADA_POS = {"side": -1, "qty": 1500.0, "entry": 0.7312, "opened_at": BAR0 - 4 * H, "entry_fee": 0.55,
+           "margin": 365.6, "liq_price": 0.97, "stop": 0.7755, "take_profit": None, "funding": 0.0}
+
+
+@pytest.fixture
+def basket(shared):
+    """切换之后的 USDT（shared）再加上 USDC 篮子：账本 usdc_basket.db、一个带 [X/USDC] 标签的日志、
+    自己的 guard 日志 / 状态 / 单元；ETH 多单、ADA 空单在仓，XRP 有一条 ERROR，LINK 有一条对账警告。"""
+    env = shared
+    data = env.root / "data"
+    env.usdc = {c: Storage(data / "usdc_basket.db", run) for c, run in USDC_RUNS.items()}
+    for c, st in env.usdc.items():
+        st.record_equity(BAR0 - 4 * H, 555.0)
+        st.record_equity(BAR0, 556.5)
+        st.save_state(state())
+    env.usdc["ETH"].save_state(state(ETH_POS))
+    env.usdc["ADA"].save_state(state(ADA_POS, signal=-1))
+    env.usdc["ETH"].record_fill(Fill(BAR0 - 8 * H, "buy", 0.4, 3850.0, 0.77, "signal"))
+    env.usdc["ADA"].record_fill(Fill(BAR0 - 4 * H, "sell", 1500.0, 0.7312, 0.55, "signal"))
+    (data / "portfolio_guard_usdc.json").write_text(
+        json.dumps({"peak": 5030.0, "halted": False, "reason": None, "updated": None}))
+    env.usdc_guard_lines = [
+        f"{utc(BAR0 - 2 * H)}  权益 5000.00  峰值 5000.00  回撤 +0.00%  持仓 2  免费 4100.00",
+        f"{utc(NOW - 3 * 60_000)}  权益 5012.30  峰值 5030.00  回撤 -0.35%  持仓 2  免费 3950.00",
+    ]
+    env.write_usdc_guard = lambda: (env.logs / "guard-usdc.log").write_text("\n".join(env.usdc_guard_lines) + "\n")
+    env.write_usdc_guard()
+    lines = [tagged_line(BAR0 - H, "INFO", "bot.engine.live_multi", "-",
+                         "启动 testnet 模式（一个进程 9 个币）: binance BTC/USDC,... 4h 每个币按权益的 11.11%，停机标志 data/HALT_USDC")]
+    for i, c in enumerate(dash.USDC_COINS):
+        lines.append(tagged_line(BAR0 - H + 1000 * (i + 1), "INFO", "bot.engine.live_multi", f"{c}/USDC",
+                                 f"启动: {c}/USDC:USDC 4h 策略 ma_cross"))
+    lines += [
+        tagged_line(BAR0 - 30 * 60_000, "ERROR", "bot.engine.live", "XRP/USDC", "本轮处理出错：下一轮先与交易所核对持仓，再重试"),
+        "Traceback (most recent call last):",
+        '  File "x.py", line 1, in <module>',
+        'ccxt.base.errors.ExchangeError: binance {"code":-1000,"msg":"An unknown error occured"}',
+        tagged_line(BAR0 - 20 * 60_000, "WARNING", "bot.broker.ccxt_broker", "LINK/USDC",
+                    "本地持仓与交易所不一致，以交易所为准：本地 +1 30.000000，交易所 无"),
+    ]
+    for i, c in enumerate(dash.USDC_COINS):
+        lines.append(tagged_line(BAR0 + 4 * H + 1000 * (i + 1), "INFO", "bot.engine.live", f"{c}/USDC",
+                                 bar_msg(USDC_CLOSE[c], "-1" if c == "ADA" else "+1", "556.50")))
+    (env.logs / "usdc.log").write_text("\n".join(lines) + "\n")
+    env.cfg.usdc = dash.Account(**{**dash.usdc_basket().__dict__, "guard_log": env.logs / "guard-usdc.log",
+                                   "bots": {c: ("tradingbot-usdc.service", env.logs / "usdc.log") for c in dash.USDC_COINS}})
+    env.services.update({
+        "tradingbot-usdc.service": {"ActiveState": "active", "SubState": "running",
+                                    "ActiveEnterTimestamp": f"@{(BAR0 - H) // 1000}", "NRestarts": "0"},
+        "tradingbot-guard-usdc.service": {"Result": "success", "ExecMainStatus": "0",
+                                          "ExecMainExitTimestamp": f"@{(NOW - 180_000) // 1000}"},
+        "tradingbot-guard-usdc.timer": {"ActiveState": "active", "LastTriggerUSec": "Thu 2026-10-22 04:17:30 UTC"},
+    })
+    env.cgroup_states["tradingbot-usdc.service"] = "active"
+    env.marks = {"ETH/USDC:USDC": 3900.0, "ADA/USDC:USDC": 0.71}
+    yield env
+    for st in env.usdc.values():
+        st.conn.close()
+
+
+def by_account(snap, asset):
+    return [(a["level"], a["text"]) for a in snap["alerts"] if a["account"] == asset]
+
+
+def test_default_config_matches_the_usdc_units_and_config():
+    from bot.config import load_config
+    import portfolio_guard as pg
+
+    root = Path(__file__).resolve().parents[1]
+    usdc = dash.Config().usdc
+    unit = (root / "deploy/systemd/tradingbot-usdc.service").read_text(encoding="utf-8")
+    guard = (root / "deploy/systemd/tradingbot-guard-usdc.service").read_text(encoding="utf-8")
+    cfg = load_config(root / "config.usdc-basket.example.yaml")
+    assert usdc.asset == "USDC" and usdc.optional
+    assert usdc.bots == {c: ("tradingbot-usdc.service", Path("/var/log/tradingbot-usdc.log")) for c in dash.USDC_COINS}
+    assert "StandardOutput=append:/var/log/tradingbot-usdc.log" in unit and "config.usdc-basket.yaml" in unit
+    assert list(cfg.symbols) == [f"{c}/USDC" for c in dash.USDC_COINS]
+    assert (cfg.live.db_path, cfg.live.halt_file) == (usdc.db, usdc.halt_file)
+    assert pg.files_for("USDC") == (Path(usdc.guard_state), Path(usdc.halt_file))
+    assert f"StandardOutput=append:{usdc.guard_log}" in guard and "--asset USDC" in guard
+    assert f"--max-dd {dash.Config().max_dd:.2f}" in guard
+    assert (usdc.guard_service, usdc.guard_timer) == ("tradingbot-guard-usdc.service", "tradingbot-guard-usdc.timer")
+    assert (root / "deploy/systemd" / usdc.guard_timer).exists()
+
+
+def test_nine_coin_log_is_split_by_tag(basket):
+    lines = dash.tail_lines(basket.logs / "usdc.log", 1 << 20)
+    parsed = {c: dash.parse_bot_log(lines, timezone.utc, c) for c in dash.USDC_COINS}
+    assert {c: p["last_bar"]["close"] for c, p in parsed.items()} == {c: float(v) for c, v in USDC_CLOSE.items()}
+    assert parsed["ADA"]["last_bar"]["signal"] == -1
+    assert [c for c, p in parsed.items() if p["errors"]] == ["XRP"]
+    assert 'ExchangeError: binance {"code":-1000' in parsed["XRP"]["errors"][0]["detail"]
+    assert [c for c, p in parsed.items() if p["warnings"]] == ["LINK"]
+    assert {p["last_start"] for p in parsed.values()} == {BAR0 - H}  # 进程级 [-] 的启动算每个币都有
+    # BTC / SOL 在两套里都有，但 USDC 的日志只有 [BTC/USDC]：不会读成 USDT 那边的行
+    assert parsed["BTC"]["last_bar"]["close"] == 82901.10
+
+
+def test_usdc_basket_snapshot(basket):
+    calls = []
+
+    def show(unit, props):
+        calls.append(unit)
+        return basket.show(unit, props)
+
+    snap = basket.snapshot(show=show)
+    u = snap["usdc"]
+    assert u["asset"] == "USDC" and u["enabled"]
+    assert [b["name"] for b in u["bots"]] == list(dash.USDC_COINS)
+    assert all(b["unit"] == "tradingbot-usdc.service" and b["service"]["ActiveState"] == "active" for b in u["bots"])
+    assert calls.count("tradingbot-usdc.service") == 1  # 9 个币共用的服务只查一次
+    bots = {b["name"]: b for b in u["bots"]}
+    assert bots["BTC"]["symbol"] == "BTC/USDC:USDC" and bots["BTC"]["last_bar"]["close"] == 82901.10
+    assert all(b["last_bar"]["open_ts"] == BAR0 and not b["bar_overdue"] for b in u["bots"])
+    eth, ada = bots["ETH"]["position"], bots["ADA"]["position"]
+    assert eth["upnl"] == pytest.approx(0.4 * 50) and eth["stop"] == 3700.0
+    assert ada["mark"] == 0.71 and ada["upnl"] == pytest.approx(1500 * (0.7312 - 0.71)) and ada["upnl"] > 0
+    assert [b["name"] for b in u["bots"] if b["position"]] == ["ETH", "ADA"]
+    assert (bots["XRP"]["errors_24h"], bots["LINK"]["warnings_24h"], bots["BTC"]["errors_24h"]) == (1, 1, 0)
+
+    a = u["account"]
+    assert (a["equity"], a["peak"], a["positions"], a["free"]) == (5012.30, 5030.0, 2, 3950.0)
+    assert a["drawdown"] == pytest.approx(5012.3 / 5030 - 1)
+    assert a["guard_line"] == pytest.approx(5030 * 0.8) and a["distance"] == pytest.approx(5012.3 - 4024)
+    assert a["return"] == pytest.approx(5012.3 / 5000 - 1)
+    assert [p[1] for p in u["curve"]] == [5000.0, 5012.30]
+    assert [(f["symbol"], f["side"]) for f in u["fills"]] == [("ADA", "sell"), ("ETH", "buy")]
+    g = u["guard"]
+    assert (g["service"], g["result"], g["timer_active"]) == ("tradingbot-guard-usdc.service", "success", "active")
+    assert g["last_line"] == NOW - 3 * 60_000 and g["halt_file"] == "data/HALT_USDC" and g["halt_flag"] is None
+
+    # USDT 这一套还在顶层，和以前一样
+    assert snap["asset"] == "USDT" and snap["enabled"] and snap["account"]["equity"] == 1150.0
+    assert [b["name"] for b in snap["bots"]] == ["BTC", "SOL"] and len(snap["fills"]) == 3
+    assert snap["guard"]["service"] == "tradingbot-guard.service"
+    # 健康时 USDC 只有日志里那两条
+    assert by_account(snap, "USDC") == [("warning", "XRP 最近 24 小时有 1 条 ERROR"),
+                                        ("warning", "LINK 最近 24 小时有 1 条对账类警告")]
+    body = json.dumps(snap, ensure_ascii=False, separators=(",", ":")).encode()
+    assert len(gzip.compress(body)) < 10_000
+
+
+def test_alerts_stay_in_their_own_account(basket):
+    basket.services["tradingbot-usdc.service"]["ActiveState"] = "failed"
+    basket.services["tradingbot-guard-usdc.timer"]["ActiveState"] = "inactive"
+    basket.usdc_guard_lines.append(f"{utc(NOW + 15 * 60_000)}  权益 5012.30  峰值 5030.00  回撤 -0.35%  持仓 2  免费 3950.00")
+    basket.write_usdc_guard()
+    snap = basket.snapshot(now=NOW + 30 * 60_000)  # USDC guard 15 分钟前还有记录，USDT guard 已 35 分钟没有
+    usdc, usdt = by_account(snap, "USDC"), by_account(snap, "USDT")
+    assert ("critical", "BTC、SOL、ETH、XRP、LTC、BCH、ADA、LINK、BNB 服务未运行（failed）") in usdc
+    assert ("critical", "guard 定时器未运行（inactive）") in usdc
+    assert ("serious", "guard 已 15 分钟没有新记录") in usdc
+    assert not any("服务未运行" in t or "定时器" in t for _, t in usdt)
+    assert ("serious", "guard 已 35 分钟没有新记录") in usdt
+    assert ("warning", "SOL 最近 24 小时有 1 条 ERROR") in usdt  # USDT 的 SOL，不是 USDC 的
+    assert not any(t.startswith("SOL ") for _, t in usdc)
+    assert {a["account"] for a in snap["alerts"]} == {"USDT", "USDC"}
+    assert snap["alerts"][0]["level"] == "critical"
+
+    # 持仓数核对也各算各的：USDC guard 说 3 个，USDC 账本 2 个；USDT 照旧一致
+    basket.usdc_guard_lines.append(f"{utc(NOW)}  权益 5012.30  峰值 5030.00  回撤 -0.35%  持仓 3  免费 3950.00")
+    basket.write_usdc_guard()
+    snap = basket.snapshot()
+    assert ("warning", "交易所持仓数 3（guard 记录）与账本持仓数 2 不一致") in by_account(snap, "USDC")
+    assert not any("不一致" in t for _, t in by_account(snap, "USDT"))
+
+
+def test_usdc_halt_flag_and_missing_stop(basket):
+    (basket.root / "data" / "HALT_USDC").write_text("人工暂停开仓\n", encoding="utf-8")
+    basket.usdc["ETH"].save_state(state({**ETH_POS, "stop": None}))
+    snap = basket.snapshot()
+    usdc = by_account(snap, "USDC")
+    assert ("serious", "停机标志 data/HALT_USDC 存在，机器人不开新仓（平仓、止损照常）：人工暂停开仓") in usdc
+    assert ("serious", "ETH 有持仓但账本里没有止损价") in usdc
+    assert snap["usdc"]["guard"]["halt_flag"] == "人工暂停开仓"
+    assert snap["guard"]["halt_flag"] is None and not any("停机" in t for _, t in by_account(snap, "USDT"))
+
+    # guard 停机时它自己会写标志：只报 guard 停机那一条，不重复
+    (basket.root / "data" / "portfolio_guard_usdc.json").write_text(
+        json.dumps({"peak": 5030.0, "halted": True, "reason": "组合回撤 -20.10%（阈值 20%）", "updated": None}))
+    usdc = by_account(basket.snapshot(), "USDC")
+    assert ("critical", "组合 guard 已停机：组合回撤 -20.10%（阈值 20%）") in usdc
+    assert not any(t.startswith("停机标志") for _, t in usdc)
+
+    # USDT 的 data/HALT 同样会报，而且只算 USDT
+    (basket.root / "data" / "HALT").write_text("", encoding="utf-8")
+    snap = basket.snapshot()
+    assert ("serious", "停机标志 data/HALT 存在，机器人不开新仓（平仓、止损照常）：停机标志存在") in by_account(snap, "USDT")
+
+
+def test_usdc_missing_is_disabled_without_alerts(env):
+    """env 里没有 USDC 的任何文件（例如以后停掉篮子、账本挪走了）：显示“未启用”，不查 systemd，不报警。"""
+    calls = []
+
+    def show(unit, props):
+        calls.append(unit)
+        return env.show(unit, props)
+
+    snap = env.snapshot(show=show)
+    assert snap["usdc"] == {"asset": "USDC", "enabled": False, "disabled_reason": "没有账本 data/usdc_basket.db",
+                            "account": None, "curve": [], "bots": [], "fills": [], "guard": None}
+    assert not any("usdc" in u for u in calls)
+    assert by_account(snap, "USDC") == [] and snap["account"]["equity"] == 1150.0
+    assert {lvl for lvl, _ in levels(snap)} == {"warning"}
+
+
+def test_one_broken_account_does_not_take_down_the_other(basket):
+    # USDT 读不到账本（USDT 不是可选的）：USDT 报严重，USDC 照常算
+    basket.cfg.db = "data/missing.db"
+    snap = basket.snapshot()
+    assert any(lvl == "critical" and "读取账本失败" in t for lvl, t in by_account(snap, "USDT"))
+    assert snap["usdc"]["account"]["equity"] == 5012.30 and len(snap["usdc"]["bots"]) == 9
+    assert snap["usdc"]["bots"][2]["position"]["upnl"] == pytest.approx(20.0)
+    assert not any("读取账本失败" in t for _, t in by_account(snap, "USDC"))
+
+
+def test_usdc_guard_files_missing_is_an_alert_not_a_crash(basket):
+    (basket.logs / "guard-usdc.log").unlink()
+    (basket.root / "data" / "portfolio_guard_usdc.json").unlink()
+    snap = basket.snapshot()
+    assert snap["usdc"]["enabled"] and snap["usdc"]["account"] is None
+    assert ("serious", "guard 日志里没有权益记录") in by_account(snap, "USDC")
+    assert snap["account"]["equity"] == 1150.0
+
+
+def test_mark_failures_are_one_alert_per_account(basket):
+    basket.mark_price = None
+    found = levels(basket.snapshot())
+    assert [t for lvl, t in found if "标记价" in t] == ["SOL 标记价获取失败，浮动盈亏暂缺: TimeoutError",
+                                                       "ETH、ADA 标记价获取失败，浮动盈亏暂缺: TimeoutError"]
+
+
+# ---- 标记价缓存 -------------------------------------------------------------
+
+class FakeFetch:
+    def __init__(self):
+        self.calls, self.fail = [], {}
+
+    def __call__(self, symbol):
+        self.calls.append(symbol)
+        if symbol in self.fail:
+            raise self.fail[symbol]
+        return 100.0 + len(self.calls)
+
+
+def test_mark_cache_requests_each_symbol_at_most_once_per_ttl():
+    t = [0.0]
+    fetch = FakeFetch()
+    marks = dash.MarkCache(fetch, ttl=60, clock=lambda: t[0])
+    assert marks("BTC/USDC:USDC") == 101.0 and marks("BTC/USDC:USDC") == 101.0
+    assert marks("ETH/USDC:USDC") == 102.0
+    t[0] = 59.9
+    assert marks("BTC/USDC:USDC") == 101.0 and len(fetch.calls) == 2
+    t[0] = 60.0
+    assert marks("BTC/USDC:USDC") == 103.0 and len(fetch.calls) == 3
+
+
+def test_mark_cache_pauses_every_symbol_when_the_network_or_rate_limit_fails():
+    t = [0.0]
+    fetch = FakeFetch()
+    marks = dash.MarkCache(fetch, ttl=60, clock=lambda: t[0])
+    fetch.fail["BTC/USDC:USDC"] = TimeoutError("timed out")
+    for sym in ("BTC/USDC:USDC", "ETH/USDC:USDC", "ADA/USDC:USDC"):
+        with pytest.raises(TimeoutError):
+            marks(sym)
+    assert fetch.calls == ["BTC/USDC:USDC"]  # 一次快照最多等一个超时
+    t[0] = 61
+    fetch.fail.clear()
+    assert marks("ETH/USDC:USDC") == 102.0
+
+    # 限频：同样全部暂停
+    fetch.fail["ETH/USDC:USDC"] = urllib.error.HTTPError("u", 429, "Too Many Requests", {}, None)
+    t[0] = 200
+    with pytest.raises(urllib.error.HTTPError):
+        marks("ETH/USDC:USDC")
+    with pytest.raises(urllib.error.HTTPError):
+        marks("BNB/USDC:USDC")
+    assert "BNB/USDC:USDC" not in fetch.calls
+
+
+def test_mark_cache_bad_symbol_does_not_block_the_others():
+    t = [0.0]
+    fetch = FakeFetch()
+    marks = dash.MarkCache(fetch, ttl=60, clock=lambda: t[0])
+    fetch.fail["XXX/USDC:USDC"] = urllib.error.HTTPError("u", 400, "Bad Request", {}, None)
+    with pytest.raises(urllib.error.HTTPError):
+        marks("XXX/USDC:USDC")
+    with pytest.raises(urllib.error.HTTPError):
+        marks("XXX/USDC:USDC")  # 失败也缓存，不每次重打
+    assert marks("ETH/USDC:USDC") == 102.0
+    assert fetch.calls == ["XXX/USDC:USDC", "ETH/USDC:USDC"]
+
+
+def test_snapshots_share_mark_requests(basket):
+    """页面每分钟刷新、快照缓存 30 秒：11 个仓位也是每个品种每分钟最多一次请求。"""
+    t = [0.0]
+    fetch = FakeFetch()
+    marks = dash.MarkCache(fetch, ttl=60, clock=lambda: t[0])
+    for t[0] in (0, 30, 59):
+        dash.build_snapshot(basket.cfg, NOW, show=basket.show, mark=marks, cgroup=basket.cgroup)
+    assert sorted(fetch.calls) == ["ADA/USDC:USDC", "ETH/USDC:USDC", "SOL/USDT:USDT"]
 
 
 # ---- 只读 -----------------------------------------------------------------

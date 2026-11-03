@@ -1,5 +1,8 @@
 """只读交易看板：从账本、日志和 systemd 读出状态，用一个只监听 127.0.0.1 的小网页展示。
 
+同一个 Binance Demo 账户里按保证金资产分两套看：USDT（BTC + SOL）和 USDC（9 币篮子），
+各有自己的账本、guard、停机标志和告警（见 Account）；USDC 的账本不在就显示“未启用”。
+
 只用标准库（不 import ccxt / pandas / bot.*），常驻只占二三十 MB；
 不读 .env、不需要 API Key：浮动盈亏用 Binance Demo 的公开标记价接口算。
 SQLite 以 `mode=ro` 打开，不会写入或锁住机器人的账本。
@@ -20,9 +23,11 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, tzinfo
+from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote
@@ -45,11 +50,37 @@ BAR_RE = re.compile(r"^K 线收盘 (\d{4}-\d\d-\d\d \d\d:\d\d) close=(-?[\d.]+) 
 
 
 USDT_BOT = ("tradingbot-usdt.service", Path("/var/log/tradingbot-usdt.log"))
+USDC_BOT = ("tradingbot-usdc.service", Path("/var/log/tradingbot-usdc.log"))
+USDC_COINS = ("BTC", "SOL", "ETH", "XRP", "LTC", "BCH", "ADA", "LINK", "BNB")  # config.usdc-basket.yaml
+
+
+@dataclass
+class Account:
+    """一套账户：一种保证金资产下的机器人、账本、guard 和停机标志（相对路径以 Config.root 为基准）。
+    同一个 Demo 账户里 USDT、USDC 各一套，互不相干：各算各的权益、回撤和告警。"""
+    asset: str                 # USDT / USDC：页面和告警里用它区分两套
+    db: str
+    guard_state: str
+    guard_log: Path
+    guard_service: str
+    guard_timer: str
+    halt_file: str
+    bots: dict                 # 品种 -> (systemd 服务, 日志) 或候选列表，见 Config.bots
+    optional: bool = False     # True：账本不存在就显示“未启用”（比如篮子停了、账本挪走了），不报警
+
+
+def usdc_basket() -> Account:
+    """USDC 平行前向测试（DEPLOY.md 第 12、13 节）：9 个币一个进程，共用一个带 [BTC/USDC] 标签的日志。"""
+    return Account(asset="USDC", db="data/usdc_basket.db", guard_state="data/portfolio_guard_usdc.json",
+                   guard_log=Path("/var/log/tradingbot-guard-usdc.log"),
+                   guard_service="tradingbot-guard-usdc.service", guard_timer="tradingbot-guard-usdc.timer",
+                   halt_file="data/HALT_USDC", bots={coin: USDC_BOT for coin in USDC_COINS}, optional=True)
 
 
 @dataclass
 class Config:
     root: Path = Path("/opt/tradingbot")
+    # USDT 这一套（BTC + SOL）。字段名沿用只有它一套时的写法，accounts() 把它拼成 Account。
     db: str = "data/portfolio.db"
     guard_state: str = "data/portfolio_guard.json"
     guard_log: Path = Path("/var/log/tradingbot-guard.log")
@@ -62,16 +93,24 @@ class Config:
     })
     guard_service: str = "tradingbot-guard.service"
     guard_timer: str = "tradingbot-guard.timer"
+    halt_file: str = "data/HALT"
+    usdc: Account | None = field(default_factory=usdc_basket)  # None = 不看 USDC 篮子
     bar_hours: float = 4.0
     bar_grace_min: float = 30.0   # K 线收盘后超过 1 根 + 这么多分钟还没处理下一根就报警
     guard_stale_min: float = 12.0  # guard 每 5 分钟一行，超过这么久没新行就报警
-    max_dd: float = 0.20          # 与 tools/portfolio_guard.py 的 --max-dd 保持一致
+    max_dd: float = 0.20          # 与 tools/portfolio_guard.py 的 --max-dd 保持一致（USDT、USDC 都是 20%）
     log_tail_bytes: int = 512 * 1024
     curve_points: int = 600
+    bot_curve_points: int = 120   # 每个币的账本权益（页面没画，11 个币全量的话 90 天后快照要大好几倍）
     log_tz: tzinfo | None = None  # 机器人日志用服务器本地时间；None = 系统时区
 
     def path(self, p: str) -> Path:
         return self.root / p
+
+    def accounts(self) -> list[Account]:
+        usdt = Account("USDT", self.db, self.guard_state, self.guard_log, self.guard_service, self.guard_timer,
+                       self.halt_file, self.bots)
+        return [usdt] + ([self.usdc] if self.usdc else [])
 
 
 # ---- 读数据（全部只读） ----------------------------------------------------
@@ -234,6 +273,56 @@ def fetch_mark(symbol: str) -> float:
         return float(json.loads(r.read(4096))["markPrice"])
 
 
+class MarkCache:
+    """标记价缓存，和 fetch_mark 一样调用。两套账户最多 11 个币有仓，每个品种 ttl 秒内最多请求一次，
+    几个页面、每次刷新都共用：页面一直开着时每分钟最多 11 次（每次权重 1，Demo 每分钟上限 2400）。
+
+    失败也记 ttl 秒。网络不通、限频（418 / 429）或服务端出错时所有品种一起歇 ttl 秒，
+    一次快照最多等一个超时，也不会在限频时继续打（机器人下单走的是同一个 IP 和 Demo 站）。
+    Snapshots 串行地生成快照，所以这里不加锁。"""
+
+    def __init__(self, fetch=fetch_mark, ttl: float = 60.0, clock=time.monotonic):
+        self.fetch, self.ttl, self.clock = fetch, ttl, clock
+        self.cache: dict[str, tuple[float, float | Exception]] = {}
+        self.paused: tuple[float, Exception] | None = None  # (到什么时候, 为什么)
+
+    def __call__(self, symbol: str) -> float:
+        now = self.clock()
+        hit = self.cache.get(symbol)
+        if hit is None or now - hit[0] >= self.ttl:
+            if self.paused and now < self.paused[0]:
+                raise self.paused[1].with_traceback(None)
+            try:
+                hit = (now, self.fetch(symbol))
+            except Exception as e:  # noqa: BLE001 - 由调用方降级成“浮动盈亏暂缺”
+                hit = (now, e)
+                symbol_only = isinstance(e, urllib.error.HTTPError) and 400 <= e.code < 500 and e.code not in (418, 429)
+                if not symbol_only:
+                    self.paused = (now + self.ttl, e)
+            self.cache[symbol] = hit
+        if isinstance(hit[1], Exception):
+            raise hit[1].with_traceback(None)
+        return hit[1]
+
+
+def read_halt(path: Path) -> str | None:
+    """停机标志（bot/halt.py）：不存在返回 None，存在返回原因。读不了也算存在，和机器人的判断一致。"""
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        return f"读不了内容（{type(e).__name__}），机器人按已停机处理"
+    return text[:300] or "停机标志存在"
+
+
+def _exists(path: Path) -> bool:
+    try:
+        return path.exists()
+    except OSError:
+        return True  # 看不见不等于不存在：照常去读，读不了会报“读取账本失败”
+
+
 # ---- 汇总 -----------------------------------------------------------------
 
 def run_symbol(run: str) -> str:
@@ -261,54 +350,98 @@ def downsample(points: list[list], max_points: int) -> list[list]:
     return out
 
 
+LEVELS = {"critical": 0, "serious": 1, "warning": 2, "info": 3}
+BOT_PROPS = ["ActiveState", "SubState", "ActiveEnterTimestamp", "NRestarts"]
+
+
+class _Systemd:
+    """一次快照里的 systemd 查询：几个币（或两套账户）共用一个服务时只查一次；
+    systemctl 读不到时，机器人服务改看 cgroup。"""
+
+    def __init__(self, show, cgroup):
+        self.show, self.cgroup = show, cgroup
+        self.bots: dict[str, dict] = {}
+        self.errors: list[str] = []
+
+    def get(self, unit: str, props: list[str]) -> dict:
+        svc = _service(self.show, unit, props)
+        if "error" in svc:
+            self.errors.append(svc["error"])
+        return svc
+
+    def bot(self, unit: str) -> dict:
+        if unit not in self.bots:
+            svc = self.get(unit, BOT_PROPS)
+            if "error" in svc:
+                svc = {**self.cgroup(unit), "error": svc["error"]}
+            self.bots[unit] = svc
+        return self.bots[unit]
+
+
 def build_snapshot(cfg: Config, now_ms: int | None = None, show=systemctl_show, mark=fetch_mark,
                    cgroup=cgroup_state) -> dict:
+    """USDT 这一套的字段（account / curve / bots / fills / guard）留在顶层，和只有它一套时一样；
+    USDC 篮子同样的结构放在 "usdc" 下。alerts 是两套合在一起的，每条带 account 标明是哪一套。"""
     now_ms = now_ms or int(time.time() * 1000)
-    bar_ms = int(cfg.bar_hours * HOUR_MS)
+    systemd = _Systemd(show, cgroup)
     alerts: list[dict] = []
+    views = [account_snapshot(cfg, acct, now_ms, systemd, mark, alerts) for acct in cfg.accounts()]
+
+    if systemd.errors:
+        alerts.append({"level": "info", "account": None,
+                       "text": f"读不到 systemd 状态，服务是否在跑改看 cgroup，guard 看日志：{systemd.errors[0]}"})
+        _log_once(systemd.errors[0])
+    alerts.sort(key=lambda a: LEVELS[a["level"]])
+    main, *others = views
+    return {
+        "generated_at": now_ms, "bar_hours": cfg.bar_hours,
+        "thresholds": {"bar_grace_min": cfg.bar_grace_min, "guard_stale_min": cfg.guard_stale_min},
+        **main, **{v["asset"].lower(): v for v in others}, "alerts": alerts,
+    }
+
+
+def account_snapshot(cfg: Config, acct: Account, now_ms: int, systemd: _Systemd, mark, alerts: list) -> dict:
+    """一套账户的权益曲线、回撤、持仓、成交和 guard；告警加进 alerts（带 account）。"""
+    bar_ms = int(cfg.bar_hours * HOUR_MS)
+    view = {"asset": acct.asset, "enabled": True, "disabled_reason": None, "account": None, "curve": [],
+            "bots": [], "fills": [], "guard": None}
 
     def alert(level: str, text: str) -> None:
-        alerts.append({"level": level, "text": text})
+        alerts.append({"level": level, "account": acct.asset, "text": text})
+
+    if acct.optional and not _exists(cfg.path(acct.db)):
+        return {**view, "enabled": False, "disabled_reason": f"没有账本 {acct.db}"}
 
     # 账本
     try:
-        db = read_db(cfg.path(cfg.db))
+        db = read_db(cfg.path(acct.db))
     except (sqlite3.Error, OSError) as e:
         db = {"runs": {}, "fills": []}
         alert("critical", f"读取账本失败: {e}")
     run_by_base = {run_symbol(r).split("/")[0]: r for r in db["runs"]}
 
     # 机器人
-    bots = []
-    systemd_errors: list[str] = []
+    bots = view["bots"]
     positions_open = 0
-    services: dict[str, dict] = {}       # 几个币共用一个服务 / 日志时只查、只读一次
-    logs: dict[Path, list[str]] = {}
+    logs: dict[Path, list[str]] = {}     # 几个币共用一个日志时只读一次
     down: dict[str, list[str]] = {}      # 没在跑的服务 -> 靠它的币
+    no_mark: list[str] = []
+    mark_error = None
 
-    def service(unit: str) -> dict:
-        if unit not in services:
-            svc = _service(show, unit, ["ActiveState", "SubState", "ActiveEnterTimestamp", "NRestarts"])
-            if "error" in svc:
-                systemd_errors.append(svc["error"])
-                svc = {**cgroup(unit), "error": svc["error"]}
-            services[unit] = svc
-        return services[unit]
-
-    for name, where in cfg.bots.items():
+    for name, where in acct.bots.items():
         candidates = [where] if isinstance(where, tuple) else list(where)
-        running = [c for c in candidates if service(c[0]).get("ActiveState") == "active"]
+        running = [c for c in candidates if systemd.bot(c[0]).get("ActiveState") == "active"]
         unit, log_path = (running or candidates)[0]
         if len(running) > 1:
             alert("critical", f"{name} 同时有 {len(running)} 个服务在跑（{'、'.join(u for u, _ in running)}），"
                               f"会重复下单：停掉多余的")
         run = run_by_base.get(name)
         info = db["runs"].get(run, {"equity": [], "state": None})
-        symbol = run_symbol(run) if run else f"{name}/USDT:USDT"
+        symbol = run_symbol(run) if run else f"{name}/{acct.asset}:{acct.asset}"
         trader = (info["state"] or {}).get("trader", {})
         broker = trader.get("broker", {})
         pos = broker.get("position")
-        svc = service(unit)
+        svc = systemd.bot(unit)
         if log_path not in logs:
             logs[log_path] = tail_lines(log_path, cfg.log_tail_bytes)
         log = parse_bot_log(logs[log_path], cfg.log_tz, name)
@@ -324,7 +457,8 @@ def build_snapshot(cfg: Config, now_ms: int | None = None, show=systemctl_show, 
                 position.update(mark=m, upnl=pos["side"] * pos["qty"] * (m - pos["entry"]),
                                 upnl_pct=pos["side"] * (m / pos["entry"] - 1))
             except Exception as e:  # noqa: BLE001 - 标记价只是锦上添花
-                alert("info", f"{name} 标记价获取失败，浮动盈亏暂缺: {type(e).__name__}")
+                no_mark.append(name)
+                mark_error = mark_error or e
 
         last_eq = info["equity"][-1] if info["equity"] else None
         last_close = last_eq[0] + bar_ms if last_eq else None
@@ -344,7 +478,7 @@ def build_snapshot(cfg: Config, now_ms: int | None = None, show=systemctl_show, 
                          "signal": last_bar["signal"] if last_bar else trader.get("last_signal"),
                          "processed_at": last_bar and last_bar["processed_at"]} if last_eq else None,
             "bar_age_ms": bar_age_ms, "bar_overdue": overdue,
-            "equity_curve": [[t, e] for t, e in info["equity"]],
+            "equity_curve": downsample([[t, e] for t, e in info["equity"]], cfg.bot_curve_points),
             "last_start": log["last_start"],
             "errors": log["errors"][-10:][::-1], "warnings": log["warnings"][-10:][::-1],
             "errors_24h": sum(e["ts"] >= recent for e in log["errors"]),
@@ -359,6 +493,8 @@ def build_snapshot(cfg: Config, now_ms: int | None = None, show=systemctl_show, 
         elif overdue:
             alert("serious", f"{name} 已 {bar_age_ms / HOUR_MS:.1f} 小时没有处理新 K 线"
                              f"（警戒线 {cfg.bar_hours + cfg.bar_grace_min / 60:.1f} 小时）")
+        if position and position["stop"] is None:
+            alert("serious", f"{name} 有持仓但账本里没有止损价")
         if broker.get("unresolved"):
             alert("serious", f"{name} 有状态未知的订单 {broker['unresolved'].get('id')}，等待核对")
         if (trader.get("risk") or {}).get("halted"):
@@ -369,13 +505,15 @@ def build_snapshot(cfg: Config, now_ms: int | None = None, show=systemctl_show, 
             alert("warning", f"{name} 最近 24 小时有 {bot['warnings_24h']} 条对账类警告")
 
     for unit, names in down.items():  # 一个进程停了只报一条，列出靠它的币
-        alert("critical", f"{'、'.join(names)} 服务未运行（{services[unit].get('ActiveState') or '未知'}）")
+        alert("critical", f"{'、'.join(names)} 服务未运行（{systemd.bots[unit].get('ActiveState') or '未知'}）")
+    if no_mark:
+        alert("info", f"{'、'.join(no_mark)} 标记价获取失败，浮动盈亏暂缺: {type(mark_error).__name__}")
 
     # 账户（guard）
-    guard_log = parse_guard_log(tail_lines(cfg.guard_log, 64 * 1024 * 1024))
+    guard_log = parse_guard_log(tail_lines(acct.guard_log, 64 * 1024 * 1024))
     pts = guard_log["points"]
     try:
-        gstate = json.loads(cfg.path(cfg.guard_state).read_text(encoding="utf-8"))
+        gstate = json.loads(cfg.path(acct.guard_state).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         gstate = {}
     account = None
@@ -404,10 +542,14 @@ def build_snapshot(cfg: Config, now_ms: int | None = None, show=systemctl_show, 
     else:
         alert("serious", "guard 日志里没有权益记录")
 
+    # 停机标志：guard 停机时它也会写，那时上面已经报了；只有标志、guard 没停机的是人工建的
+    halt_flag = read_halt(cfg.path(acct.halt_file))
+    if halt_flag is not None and not (account and account["halted"]):
+        alert("serious", f"停机标志 {acct.halt_file} 存在，机器人不开新仓（平仓、止损照常）：{halt_flag}")
+
     # 读不到 systemd 时 guard 的死活只看日志新不新（上面“没有新记录”的告警）
-    gsvc = _service(show, cfg.guard_service, ["Result", "ExecMainStatus", "ExecMainExitTimestamp"])
-    gtimer = _service(show, cfg.guard_timer, ["ActiveState", "LastTriggerUSec"])
-    systemd_errors += [x["error"] for x in (gsvc, gtimer) if "error" in x]
+    gsvc = systemd.get(acct.guard_service, ["Result", "ExecMainStatus", "ExecMainExitTimestamp"])
+    gtimer = systemd.get(acct.guard_timer, ["ActiveState", "LastTriggerUSec"])
     guard = {
         "result": gsvc.get("Result"), "exit_status": gsvc.get("ExecMainStatus"),
         "last_exit": _unix_ms(gsvc.get("ExecMainExitTimestamp")),
@@ -415,6 +557,7 @@ def build_snapshot(cfg: Config, now_ms: int | None = None, show=systemctl_show, 
         "last_line": pts[-1]["ts"] if pts else None,
         "events": guard_log["events"][-10:][::-1],
         "systemd_error": gtimer.get("error") or gsvc.get("error"),
+        "service": acct.guard_service, "halt_file": acct.halt_file, "halt_flag": halt_flag,
     }
     if "error" not in gtimer and gtimer.get("ActiveState") != "active":
         alert("critical", f"guard 定时器未运行（{gtimer.get('ActiveState') or '未知'}）")
@@ -425,19 +568,8 @@ def build_snapshot(cfg: Config, now_ms: int | None = None, show=systemctl_show, 
     fills = [{**{k: f[k] for k in ("ts", "side", "qty", "price", "fee", "pnl", "reason")},
               "symbol": names.get(f["run"], f["run"])} for f in sorted(db["fills"], key=lambda f: (f["ts"], f["id"]))[-500:][::-1]]
 
-    if systemd_errors:
-        alert("info", f"读不到 systemd 状态，服务是否在跑改看 cgroup，guard 看日志：{systemd_errors[0]}")
-        _log_once(systemd_errors[0])
-
-    order = {"critical": 0, "serious": 1, "warning": 2, "info": 3}
-    alerts.sort(key=lambda a: order[a["level"]])
-    return {
-        "generated_at": now_ms, "bar_hours": cfg.bar_hours,
-        "thresholds": {"bar_grace_min": cfg.bar_grace_min, "guard_stale_min": cfg.guard_stale_min},
-        "account": account,
-        "curve": downsample([[p["ts"], p["equity"]] for p in pts], cfg.curve_points),
-        "bots": bots, "fills": fills, "guard": guard, "alerts": alerts,
-    }
+    return {**view, "account": account, "curve": downsample([[p["ts"], p["equity"]] for p in pts], cfg.curve_points),
+            "fills": fills, "guard": guard}
 
 
 def _service(show, unit: str, props: list[str]) -> dict:
@@ -534,7 +666,8 @@ def make_handler(snapshots: Snapshots, html: bytes):
 def serve(cfg: Config, host: str, port: int, ttl: float) -> None:
     if not ipaddress.ip_address(host).is_loopback:
         raise SystemExit(f"只允许监听回环地址（127.0.0.1 / ::1），拒绝 {host}；远程访问请用 ssh -L 隧道")
-    handler = make_handler(Snapshots(cfg, ttl), HTML_PATH.read_bytes())
+    build = partial(build_snapshot, mark=MarkCache(fetch_mark))
+    handler = make_handler(Snapshots(cfg, ttl, build), HTML_PATH.read_bytes())
     server = ThreadingHTTPServer((host, port), handler)
     print(f"看板已启动: http://{host}:{port}  （快照缓存 {ttl:.0f} 秒）", flush=True)
     try:
@@ -555,7 +688,7 @@ def main() -> int:
 
     cfg = Config(root=Path(args.root), max_dd=args.max_dd)
     if args.once:
-        print(json.dumps(build_snapshot(cfg), ensure_ascii=False, indent=1))
+        print(json.dumps(build_snapshot(cfg, mark=MarkCache(fetch_mark)), ensure_ascii=False, indent=1))
         return 0
     serve(cfg, args.host, args.port, args.ttl)
     return 0
