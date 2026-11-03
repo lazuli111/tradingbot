@@ -6,6 +6,7 @@ Which positions belong to which guard: the settle currency in ccxt's unified sym
 the colon ("BTC/USDC:USDC" -> USDC). ccxt takes it from exchangeInfo's marginAsset; the bots trade
 the same symbols. `info.marginAsset` is not read. No network."""
 import argparse
+import re
 import shlex
 import sys
 from pathlib import Path
@@ -202,12 +203,42 @@ def test_systemd_units_run_their_own_guard(monkeypatch, unit, state, other):
     assert not other.exists() and ex.orders == []
 
 
-def test_usdc_unit_and_timer():
+def test_usdc_unit():
     argv = unit_argv("tradingbot-guard-usdc.service")
     assert argv == unit_argv("tradingbot-guard.service") + ["--asset", "USDC", "--max-dd", "0.20"]
     service = (ROOT / "deploy/systemd/tradingbot-guard-usdc.service").read_text(encoding="utf-8")
     assert "StandardOutput=append:/var/log/tradingbot-guard-usdc.log" in service
-    timer = (ROOT / "deploy/systemd/tradingbot-guard-usdc.timer").read_text(encoding="utf-8")
-    usdt_timer = (ROOT / "deploy/systemd/tradingbot-guard.timer").read_text(encoding="utf-8")
-    assert "OnBootSec=2min\n" in usdt_timer and "OnBootSec=4min30s\n" in timer   # 2.5 min apart
-    assert "OnUnitActiveSec=5min\n" in timer and "OnUnitActiveSec=5min\n" in usdt_timer
+
+
+def timer_settings(name: str) -> dict[str, list[str]]:
+    """the [Timer] section of a unit, key -> values (a key may appear more than once)"""
+    text = (ROOT / "deploy" / "systemd" / name).read_text(encoding="utf-8")
+    section, settings = None, {}
+    for line in text.splitlines():
+        if line.startswith("["):
+            section = line.strip()
+        elif section == "[Timer]" and "=" in line and not line.startswith("#"):
+            key, _, value = line.partition("=")
+            settings.setdefault(key.strip(), []).append(value.strip())
+    return settings
+
+
+def test_guard_timers_fire_on_the_clock_apart():
+    """Each guard is ~150 MB; both at once on the 1.6 GB box is the 2026-11-02 freeze. Relative timers
+    (OnBootSec + OnUnitActiveSec) drifted into the same moment after that reboot, so both run on the
+    wall clock, 2.5 minutes apart, with no AccuracySec window for systemd to coalesce them in."""
+    offsets = []
+    for name in ("tradingbot-guard.timer", "tradingbot-guard-usdc.timer"):
+        timer = timer_settings(name)
+        assert "OnBootSec" not in timer and "OnUnitActiveSec" not in timer, name
+        [calendar] = timer["OnCalendar"]
+        every_5min = re.fullmatch(r"\*:(\d+)/5:(\d+)", calendar)   # minute M/5, second S
+        assert every_5min, calendar
+        minute, second = map(int, every_5min.groups())
+        offsets.append(minute * 60 + second)
+        [accuracy] = timer["AccuracySec"]
+        value, unit = re.fullmatch(r"(\d+)(ms|s|min)", accuracy).groups()
+        assert int(value) * {"ms": 0.001, "s": 1, "min": 60}[unit] <= 1, accuracy
+    usdt, usdc = offsets
+    assert usdt != usdc
+    assert (usdc - usdt) % 300 == 150   # USDC 2.5 min after USDT, and 2.5 min before its next run

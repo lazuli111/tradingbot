@@ -307,21 +307,19 @@ Binance U 本位按 IP 每分钟 2400 权重；行情走正式站（公开接口
 
 ### 安装（admin 执行一次）
 
-两个 Python 进程不要同时跑，所以 USDC 闸门比 USDT 闸门晚约 2.5 分钟：开机后分别在 2 分钟、4 分 30 秒时第一次运行，之后各自每 5 分钟一次。机器已经开着时，`enable --now` 会立刻运行一次，之后按那一刻每 5 分钟一次，所以要挑时间启用。
+两个 Python 进程不要同时跑，所以两个闸门按钟点错开 2.5 分钟：USDT 闸门在每 5 分钟周期的第 0 分 00 秒（每小时的 00:00、05:00 … 55:00，分:秒），USDC 闸门在第 2 分 30 秒（02:30、07:30 … 57:30）。两个 timer 都是 `OnCalendar` + `AccuracySec=1s`，时刻只跟钟走，和开机时间、上一次运行无关，重启后也不会漂到一起，所以**不用挑时间启用**：`enable --now` 不会立刻跑一次，第一次就在下一个 02:30 / 07:30 …。USDT 闸门的 timer 也得是这个新写法（`OnCalendar=*:0/5:00`）；服务器上还是旧写法的话，先按下面“从旧 timer 升级”换掉，否则两边不保证错开。
 
 ```bash
 sudo -u tradingbot git -C /opt/tradingbot pull --ff-only
 sudo cp /opt/tradingbot/deploy/systemd/tradingbot-guard-usdc.service /opt/tradingbot/deploy/systemd/tradingbot-guard-usdc.timer /etc/systemd/system/
 sudo systemctl daemon-reload
-systemctl list-timers 'tradingbot-guard*' --no-pager       # 看 tradingbot-guard.timer 的 LAST
-# 等 USDT 闸门上一次运行过去约 2.5 分钟，再执行下面这行
 sudo systemctl enable --now tradingbot-guard-usdc.timer
 ```
 
 验证：
 
 ```bash
-systemctl list-timers 'tradingbot-guard*' --no-pager       # 两个 timer 的 NEXT 相差约 2.5 分钟
+systemctl list-timers 'tradingbot-guard*' --no-pager       # NEXT：USDT 在 x0:00 / x5:00，USDC 在 x2:30 / x7:30（分:秒），相差 2.5 分钟
 tail -n 3 /var/log/tradingbot-guard-usdc.log                # 权益是 USDC 余额（约 5000），持仓只数 USDC 仓位
 tail -n 3 /var/log/tradingbot-guard.log                     # USDT 那边照旧
 ```
@@ -345,6 +343,44 @@ claude-ops 这样用：
 
 ```bash
 cd /opt/tradingbot && sudo -n -u tradingbot .venv/bin/python tools/portfolio_guard.py --asset USDC --status
+```
+
+### 从旧 timer 升级（换成按钟点触发，删掉临时 drop-in）
+
+**为什么**：以前两个 timer 是 `OnBootSec`（2 分、4 分 30 秒）+ `OnUnitActiveSec=5min` + `AccuracySec=30s`，靠开机时差错开 2.5 分钟。这种时刻是“上一次运行 + 5 分钟”，systemd 还会把 AccuracySec 窗口里的唤醒对到一起：2026-11-02 强制重启之后，两个 timer 漂到了同一时刻触发，对齐之后就一直对齐，两个 guard 同时跑会重现那次内存卡死（第 14 节）。2026-11-03 先在服务器上加了两个 drop-in 顶住：
+
+| drop-in | 内容 |
+| --- | --- |
+| `/etc/systemd/system/tradingbot-guard.timer.d/schedule.conf` | 清空 `OnBootSec=`、`OnUnitActiveSec=`；`OnCalendar=*:0/5:00`，`AccuracySec=1s` |
+| `/etc/systemd/system/tradingbot-guard-usdc.timer.d/schedule.conf` | 同样清空；`OnCalendar=*:2/5:30`，`AccuracySec=1s` |
+
+现在仓库里两个 `.timer` 就是这个写法。部署新 unit 之后，drop-in 就多余了，可以删掉（admin 执行）：
+
+```bash
+sudo -u tradingbot git -C /opt/tradingbot pull --ff-only
+sudo cp /opt/tradingbot/deploy/systemd/tradingbot-guard.timer /opt/tradingbot/deploy/systemd/tradingbot-guard-usdc.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+
+# 删之前对比：每个 timer 上面一段是新的主文件，下面一段是 drop-in。
+# 两段的 OnCalendar、AccuracySec 要一样，主文件里没有 OnBootSec / OnUnitActiveSec；不一样就停下来，先别删
+systemctl cat tradingbot-guard.timer tradingbot-guard-usdc.timer
+
+sudo rm /etc/systemd/system/tradingbot-guard.timer.d/schedule.conf /etc/systemd/system/tradingbot-guard-usdc.timer.d/schedule.conf
+sudo rmdir /etc/systemd/system/tradingbot-guard.timer.d /etc/systemd/system/tradingbot-guard-usdc.timer.d   # 目录里还有别的文件会报错，那就留着
+sudo systemctl daemon-reload
+sudo systemctl restart tradingbot-guard.timer tradingbot-guard-usdc.timer
+```
+
+- 对比和删除之间，主文件和 drop-in 写的是同一个时刻，生效的配置不变。
+- 重启 timer 只是重新排下一次，不会立刻跑 guard，也不会打断正在跑的那一次。
+
+验证：
+
+```bash
+systemctl cat tradingbot-guard.timer tradingbot-guard-usdc.timer   # 只剩主文件，没有 schedule.conf
+systemctl show tradingbot-guard.timer tradingbot-guard-usdc.timer -p TimersMonotonic -p TimersCalendar -p AccuracyUSec
+#   TimersMonotonic 为空；TimersCalendar 各只有一条：*-*-* *:00/5:00 和 *-*-* *:02/5:30；AccuracyUSec=1s
+systemctl list-timers 'tradingbot-guard*' --no-pager              # NEXT：USDT 在 x0:00 / x5:00，USDC 在 x2:30 / x7:30（分:秒）
 ```
 
 ### 日常运维（USDC）
@@ -386,7 +422,7 @@ cd /opt/tradingbot && sudo -n -u tradingbot .venv/bin/python tools/portfolio_gua
 | USDT 机器人 | btc ≈ 365 + sol ≈ 365 = 730 MB | usdt ≈ 370 MB（预计：多币进程每多一个币只多几 MB） |
 | USDC 篮子 | ≈ 380 MB | ≈ 380 MB |
 | `free -m` available（平时） | ≈ 128 MB（实测） | ≈ 470 MB（128 + 省下的约 340） |
-| guard 峰值（oneshot，每 5 分钟一次，每次约 150 MB；USDT、USDC 两个错开 2.5 分钟） | 一个 guard 就超了 → 卡死 | 一个 guard 在跑时约 320 MB；万一两个撞在一起约 170 MB |
+| guard 峰值（oneshot，每 5 分钟一次，每次约 150 MB；按钟点错开：USDT 在每 5 分钟的第 0 分 00 秒，USDC 在第 2 分 30 秒，见第 13 节） | 一个 guard 就超了 → 卡死 | 一个 guard 在跑时约 320 MB；两个不会同时跑（每次只有几个请求、单个请求 20 秒超时，远短于 2.5 分钟的间隔） |
 
 - 切换后、USDC 启动前，available 预计约 850 MB；USDC 启动条件见第 12 节“启动之前”（至少 700 MB）。
 - 实测之后以实测为准：`free -m`；`cat /sys/fs/cgroup/system.slice/tradingbot-usdt.service/memory.peak`；`ps -o pid,rss,cmd -u tradingbot`。平时 available 低于约 300 MB，或者 guard 运行时低于约 150 MB，就先停 USDC 篮子（`sudo -n systemctl stop tradingbot-usdc.service`），再商量。
